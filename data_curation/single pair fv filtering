@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+
+import os
+import pandas as pd
+import shutil
+
+# === CONFIG ===
+SUMMARY_PATH = "/home/alanwu/Documents/iggen_model/data/post_alphafold_cutoff/20260305_0449097_summary.tsv"
+PDB_DIR = "/home/alanwu/Documents/iggen_model/data/post_alphafold_cutoff/chothia"
+OUT_DIR = "/home/alanwu/Documents/iggen_model/data/post_alphafold_cutoff/20260305_0449097_single_fv_pdbs"
+
+DATE_CUTOFF = "2021-09-30"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# === Load summary file ===
+df = pd.read_csv(SUMMARY_PATH, sep="\t")
+
+# Convert date column to datetime
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+# Keep only entries later than cutoff date
+df = df[df["date"] > DATE_CUTOFF]
+
+print(f"Entries after date filter: {len(df)}")
+
+# Count occurrences of each PDB ID
+counts = df["pdb"].value_counts()
+
+# Keep only PDBs appearing exactly once
+single_fv_pdbs = counts[counts == 1].index.tolist()
+
+print(f"Found {len(single_fv_pdbs)} single-Fv PDB entries after date filter.")
+
+# === Copy matching PDB files ===
+copied = 0
+for pdb_id in single_fv_pdbs:
+    src = os.path.join(PDB_DIR, f"{pdb_id}.pdb")
+    if os.path.exists(src):
+        shutil.copy(src, os.path.join(OUT_DIR, f"{pdb_id}.pdb"))
+        copied += 1
+
+print(f"✔ Copied {copied} files into: {OUT_DIR}")
+
+#C<EMNwPt^99D
