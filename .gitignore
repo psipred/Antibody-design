@@ -1,0 +1,27 @@
+# Data
+data/
+model_output/
+models/
+evaluation_metrics/
+operations/
+inference/
+immunebuilder_output/
+
+# temp
+tmp_*/
+
+# figures (optional)
+*.png
+
+# bio files
+*.pdb
+*.fasta
+*.fa
+*.a3m
+
+# python
+__pycache__/
+*.pyc
+
+# system
+.DS_Store
