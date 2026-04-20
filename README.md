@@ -30,7 +30,11 @@ We recommend installing and running inference inside a fresh conda environment.
 ```bash
 conda create -n piggen_infer python=3.11 pip -y
 conda activate piggen_infer
+
+2. Install p-IgGen
 ```bash
+pip install git+https://github.com/OliverT1/p-IgGen.git
+
 ## Overview
 ---
 
