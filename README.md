@@ -30,6 +30,7 @@ We recommend installing and running inference inside a fresh conda environment.
 ```bash
 conda create -n piggen_infer python=3.11 pip -y
 conda activate piggen_infer
+```bash
 ## Overview
 ---
 
