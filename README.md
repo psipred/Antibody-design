@@ -1,6 +1,35 @@
 # **Antibody Fv Generative Model for Structurally Reliable CDR-H3 Loops**
 ---
+# Finetuned p-IgGen Inference
 
+This repository provides a local inference workflow for our finetuned antibody language model based on **p-IgGen**. The inference script supports generation of full-length paired antibody sequences, conditional generation from a provided heavy or light chain, prompted generation from an initial sequence, optional likelihood-based filtering of outputs, and optional separation of VH and VL chains. The original p-IgGen package also provides utility functions for generation and scoring of antibody sequences, with model weights hosted on Hugging Face. :contentReference[oaicite:1]{index=1}
+
+## Features
+
+- Generate full-length antibody sequences.
+- Generate a light chain given a heavy chain.
+- Generate a heavy chain given a light chain.
+- Generate full-length antibody sequences from an initial sequence prompt.
+- Filter generated sequences by model log-likelihood.
+- Optionally output VH and VL separately.
+
+## Installation
+
+We recommend installing and running inference inside a fresh conda environment.
+
+### Prerequisites
+
+- Conda
+- Git
+- Internet access for downloading the p-IgGen package and model weights
+
+### Step-by-Step Setup
+
+1. Create and activate a new conda environment:
+
+```bash
+conda create -n piggen_infer python=3.11 pip -y
+conda activate piggen_infer
 ## Overview
 ---
 
