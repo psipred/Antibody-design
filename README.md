@@ -2,38 +2,197 @@
 ---
 # Finetuned p-IgGen Inference
 
-This repository provides a local inference workflow for our finetuned antibody language model based on **p-IgGen**. The inference script supports generation of full-length paired antibody sequences, conditional generation from a provided heavy or light chain, prompted generation from an initial sequence, optional likelihood-based filtering of outputs, and optional separation of VH and VL chains. The original p-IgGen package also provides utility functions for generation and scoring of antibody sequences, with model weights hosted on Hugging Face. :contentReference[oaicite:1]{index=1}
+This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen.
+
+The inference script supports:
+
+- Generation of full-length paired antibody sequences
+- Conditional generation from a provided heavy or light chain
+- Prompted generation from an initial sequence
+- Optional likelihood-based filtering of outputs
+- Optional separation of VH and VL chains
 
 ## Features
 
-- Generate full-length antibody sequences.
-- Generate a light chain given a heavy chain.
-- Generate a heavy chain given a light chain.
-- Generate full-length antibody sequences from an initial sequence prompt.
-- Filter generated sequences by model log-likelihood.
-- Optionally output VH and VL separately.
+- Generate full-length antibody sequences
+- Generate light chains from heavy chains
+- Generate heavy chains from light chains
+- Generate sequences from an initial prompt
+- Filter generated sequences by likelihood
+- Output VH and VL chains separately
+
+---
 
 ## Installation
-
-We recommend installing and running inference inside a fresh conda environment.
 
 ### Prerequisites
 
 - Conda
 - Git
-- Internet access for downloading the p-IgGen package and model weights
+- Internet access (for downloading model and dependencies)
 
-### Step-by-Step Setup
-
-1. Create and activate a new conda environment:
+### 1. Create environment
 
 ```bash
 conda create -n piggen_infer python=3.11 pip -y
 conda activate piggen_infer
+```
 
-2. Install p-IgGen
+### 2. Install p-IgGen
+
 ```bash
 pip install git+https://github.com/OliverT1/p-IgGen.git
+```
+
+### 3. Install required dependencies
+
+```bash
+pip install torch transformers click
+```
+
+### 4. (Optional) Install ANARCI (for VH/VL separation)
+
+```bash
+conda install -c bioconda anarci
+```
+
+### 5. (Optional) Install HMMER (required by ANARCI)
+
+```bash
+conda install -c bioconda hmmer
+```
+
+---
+
+## Inference Script
+
+Save the inference script as `github_inference.py`.
+
+---
+
+## Usage
+
+Run inference:
+
+```bash
+python github_inference.py --output_file output_sequences.txt
+```
+
+> **Notes**
+> - Generation uses sampling (`do_sample=True`)
+> - `max_new_tokens` is fixed at 400
+> - `bottom_n_percent` only applies when `n_sequences >= 100`
+> - GPU is used automatically if available
+
+---
+
+## Parameters
+
+### Model and tokenizer
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model_name TEXT` | Hugging Face model or local path | `Wu1234sdsd/piggen-merged-finetuned` |
+| `--tokenizer_name TEXT` | Tokenizer repository or path | `ollieturnbull/p-IgGen` |
+
+### Input conditioning
+
+| Flag | Description |
+|------|-------------|
+| `--heavy_chain_file TEXT` | File containing heavy chain sequences (one per line) |
+| `--light_chain_file TEXT` | File containing light chain sequences (one per line) |
+| `--initial_sequence TEXT` | Initial sequence prompt |
+
+### Sampling
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--n_sequences INTEGER` | Number of sequences to generate | `1` |
+| `--top_p FLOAT` | Top-p nucleus sampling | `0.95` |
+| `--temp FLOAT` | Sampling temperature | `1.2` |
+| `--bottom_n_percent INTEGER` | Percentage of lowest-likelihood sequences to discard (only used if `n_sequences >= 100`) | `5` |
+
+### Generation control
+
+| Flag | Description |
+|------|-------------|
+| `--backwards` | Generate sequences in reverse direction |
+| `--separate_chains` | Output VH and VL separately (requires ANARCI) |
+
+### Output
+
+| Flag | Description |
+|------|-------------|
+| `--output_file TEXT` | Output file path (required) |
+
+### Runtime
+
+| Flag | Description |
+|------|-------------|
+| `--cache_dir TEXT` | Hugging Face cache directory |
+| `--device TEXT` | Device to run inference on |
+
+Automatically selects: `cuda` → `mps` → `cpu`
+
+---
+
+## Output Format
+
+### Default output
+
+```
+SEQUENCE_1
+SEQUENCE_2
+SEQUENCE_3
+```
+
+### Conditional generation output
+
+```
+index, generated_sequence
+```
+
+### Separate chain output
+
+```
+VH_SEQUENCE, VL_SEQUENCE
+```
+
+---
+
+## Quick Test
+
+```bash
+python -c "import torch; import transformers; print('Core dependencies OK')"
+python -c "from piggen import utils; print('p-IgGen import OK')"
+python github_inference.py --help
+```
+
+---
+
+## Troubleshooting
+
+**ANARCI not found**
+```bash
+conda install -c bioconda anarci
+```
+
+**`hmmscan` not found**
+```bash
+conda install -c bioconda hmmer
+```
+
+**`--separate_chains` not working**
+
+Ensure both ANARCI and HMMER are installed and available in `PATH`.
+
+---
+
+## About
+
+This repository provides local inference for a finetuned version of p-IgGen.
+
+Upstream package: [https://github.com/OliverT1/p-IgGen](https://github.com/OliverT1/p-IgGen)
 
 ## Overview
 ---
