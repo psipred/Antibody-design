@@ -1,0 +1,1 @@
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 piggen_generate   --cache_dir /home/alanwu/Documents/iggen_model/inference   --output_file /home/alanwu/Documents/iggen_model/model_output/raw_sequences.txt   --n_sequences 200 --temp 0.5
