@@ -1,4 +1,4 @@
-# **Antibody Fv Generative Model for Structurally Reliable CDR-H3 Loops**
+# **Antibody Fv Generative Model for high accuracy prediction of CDR-H3 Loops**
 ---
 # Finetuned p-IgGen Inference
 
