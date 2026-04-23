@@ -4,13 +4,19 @@
 
 This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen.
 
-The inference script supports:
+---
 
-- Generation of full-length paired antibody sequences
-- Conditional generation from a provided heavy or light chain
-- Prompted generation from an initial sequence
-- Optional likelihood-based filtering of outputs
-- Optional separation of VH and VL chains
+## Overview
+
+The inference script (`github_inference.py`) supports three distinct generation modes:
+
+- **Unconditional generation** — generate complete paired antibody sequences from scratch
+- **Conditional generation** — provide a known heavy or light chain and generate its paired partner
+- **Prompted generation** — provide a partial sequence and let the model continue from it
+
+Additional options:
+- Likelihood-based filtering to discard low-quality outputs
+- Separation of output into VH and VL chains via ANARCI
 
 ---
 
@@ -57,23 +63,84 @@ conda install -c bioconda hmmer
 
 ## Inference Script
 
-Save the inference script as `github_inference.py`.
+Download the inference script directly from this repository:
+
+```bash
+wget https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py -O github_inference.py
+```
+
+Or with curl:
+
+```bash
+curl -o github_inference.py https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py
+```
 
 ---
 
-## Usage
+## Generation Modes
 
-Run inference:
+### 1. Unconditional generation
+
+Generate complete paired antibody sequences from scratch, with no input conditioning. The model samples freely from its learned distribution.
 
 ```bash
-python github_inference.py --output_file output_sequences.txt
+python github_inference.py \
+  --n_sequences 10 \
+  --output_file output_sequences.txt
 ```
 
-> **Notes**
-> - Generation uses sampling (`do_sample=True`)
-> - `max_new_tokens` is fixed at 400
-> - `bottom_n_percent` only applies when `n_sequences >= 100`
-> - GPU is used automatically if available
+---
+
+### 2. Conditional generation from a heavy chain
+
+Provide a file of known heavy chain sequences (one per line). For each heavy chain, the model generates a paired light chain. The heavy chain is used as a prefix prompt (`1{heavy_chain}`) and the model generates the remainder of the paired sequence.
+
+```bash
+python github_inference.py \
+  --heavy_chain_file heavy_chains.txt \
+  --n_sequences 5 \
+  --output_file output_sequences.txt
+```
+
+Output format: `index, generated_light_chain`
+
+---
+
+### 3. Conditional generation from a light chain
+
+The reverse of the above — provide known light chain sequences and the model generates a paired heavy chain for each. Internally the model runs in backwards mode, reversing the light chain and generating the heavy chain in the reverse direction.
+
+```bash
+python github_inference.py \
+  --light_chain_file light_chains.txt \
+  --n_sequences 5 \
+  --output_file output_sequences.txt
+```
+
+Output format: `index, generated_heavy_chain`
+
+> **Note:** `--heavy_chain_file` and `--light_chain_file` are mutually exclusive — passing both will raise an error.
+
+---
+
+### 4. Prompted generation from an initial sequence
+
+Provide the beginning of a sequence and the model will continue generating from it. This is open-ended generation — unlike the chain file modes, no pairing logic is applied. The model treats your input as a raw sequence prefix and samples forward from that point.
+
+The example below uses a partial heavy chain as the prompt:
+
+```bash
+python github_inference.py \
+  --initial_sequence QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKG \
+  --n_sequences 20 \
+  --top_p 0.9 \
+  --temp 1.1 \
+  --output_file output_sequences.txt
+```
+
+This generates 20 sequences that all begin with `QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKG`, with slightly tighter sampling than the defaults (`--top_p 0.9` vs `0.95`, `--temp 1.1` vs `1.2`), producing more conservative completions while still maintaining diversity.
+
+Output format: one complete sequence per line.
 
 ---
 
@@ -81,72 +148,78 @@ python github_inference.py --output_file output_sequences.txt
 
 ### Model and tokenizer
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--model_name TEXT` | Hugging Face model or local path | `Wu1234sdsd/piggen-merged-finetuned` |
-| `--tokenizer_name TEXT` | Tokenizer repository or path | `ollieturnbull/p-IgGen` |
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model_name` | TEXT | `Wu1234sdsd/piggen-merged-finetuned` | Hugging Face model repo or local path to load the finetuned model from |
+| `--tokenizer_name` | TEXT | `ollieturnbull/p-IgGen` | Hugging Face tokenizer repo or local path. Should generally be left as default unless using a custom tokenizer |
 
 ### Input conditioning
 
-| Flag | Description |
-|------|-------------|
-| `--heavy_chain_file TEXT` | File containing heavy chain sequences (one per line) |
-| `--light_chain_file TEXT` | File containing light chain sequences (one per line) |
-| `--initial_sequence TEXT` | Initial sequence prompt |
+Exactly one of the following may be provided. If none are given, the model generates unconditionally.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--heavy_chain_file` | TEXT | None | Path to a file of heavy chain sequences, one per line. For each sequence, the model generates `--n_sequences` paired light chains |
+| `--light_chain_file` | TEXT | None | Path to a file of light chain sequences, one per line. For each sequence, the model generates `--n_sequences` paired heavy chains using backwards generation |
+| `--initial_sequence` | TEXT | None | A partial sequence to use as a generation prompt. The model will continue the sequence from this prefix. Cannot be combined with `--heavy_chain_file` or `--light_chain_file` |
 
 ### Sampling
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--n_sequences INTEGER` | Number of sequences to generate | `1` |
-| `--top_p FLOAT` | Top-p nucleus sampling | `0.95` |
-| `--temp FLOAT` | Sampling temperature | `1.2` |
-| `--bottom_n_percent INTEGER` | Percentage of lowest-likelihood sequences to discard (only used if `n_sequences >= 100`) | `5` |
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--n_sequences` | INTEGER | `1` | Number of sequences to generate. When using `--heavy_chain_file` or `--light_chain_file`, this is the number of sequences generated **per input chain** |
+| `--top_p` | FLOAT | `0.95` | Nucleus sampling threshold. At each generation step, only tokens whose cumulative probability reaches `top_p` are considered. Lower values (e.g. `0.8`) make outputs more focused and conservative; higher values allow more diversity |
+| `--temp` | FLOAT | `1.2` | Sampling temperature. Higher values (e.g. `1.4`) increase randomness and sequence diversity; lower values (e.g. `0.9`) make the model more deterministic and likely to produce higher-probability sequences |
+| `--bottom_n_percent` | INTEGER | `5` | Percentage of generated sequences to discard based on model log-likelihood. Only applied when `--n_sequences >= 100`. For example, `--bottom_n_percent 10` discards the lowest-scoring 10% of outputs, returning the top 90% |
 
 ### Generation control
 
-| Flag | Description |
-|------|-------------|
-| `--backwards` | Generate sequences in reverse direction |
-| `--separate_chains` | Output VH and VL separately (requires ANARCI) |
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--backwards` | FLAG | False | Generate sequences in the reverse direction. Used internally by `--light_chain_file` mode. Can also be set manually for custom backwards generation workflows |
+| `--separate_chains` | FLAG | False | After generation, use ANARCI to split outputs into separate VH and VL chains. Requires ANARCI and HMMER to be installed. Only applies to unconditional or prompted generation — not compatible with `--heavy_chain_file` or `--light_chain_file` modes |
 
 ### Output
 
-| Flag | Description |
-|------|-------------|
-| `--output_file TEXT` | Output file path (required) |
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--output_file` | TEXT | — | Path to write output sequences. **Required.** |
 
 ### Runtime
 
-| Flag | Description |
-|------|-------------|
-| `--cache_dir TEXT` | Hugging Face cache directory |
-| `--device TEXT` | Device to run inference on |
-
-Automatically selects: `cuda` → `mps` → `cpu`
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--cache_dir` | TEXT | None | Directory for caching Hugging Face model and tokenizer downloads. Useful if you want to store model weights in a specific location or reuse a previously downloaded model |
+| `--device` | TEXT | None | Device to run inference on (`cuda`, `mps`, or `cpu`). If not specified, the script automatically selects the best available device in order: `cuda` → `mps` → `cpu` |
 
 ---
 
 ## Output Format
 
-### Default output
+### Unconditional / prompted generation
+
+One complete sequence per line:
 
 ```
-SEQUENCE_1
-SEQUENCE_2
-SEQUENCE_3
+EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYGMHWVRQAPGKGLEWVSYISSSGSTIYYADSVKGRFTISRDNAKNSLYLQMNSLRAEDTAVYYCAREDYYGMDVWGQGTTVTVSSQSALTQPASVSGSPGQSITISCTGTSSDVGSYNLVSWYQQHPGKAPKLMIYEG
+QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKGLEWVSYISSSGSTIYVADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAREDYYGMDVWGQGTTVTVSSQSALTQPASVSGSAGQSITISCTGTSSDVGSYNLVSWYQQHPGKAPKLMIY
 ```
 
-### Conditional generation output
+### Conditional generation (heavy or light chain file)
+
+Index of the input chain followed by the generated partner chain:
 
 ```
-index, generated_sequence
+0, SYELTQPPSVSVSPGQTARITCSGDALPKQYAYWYQQKSGQAPVLVIYKDSERPSGIPERFSGSNSGNTATLTISGTQAMDEADYYCQSADSSGTYVFGTGTKVTVL
+1, SYELTQPPSVSVSPGQTARITCSGDALPKQYAYWYQQKSGQAPVLVIYKDSERPSGIPERFSGSNSGNTATLTISGTQAMDEADYYCQSADSSGTYVFGTGTKVTVL
 ```
 
-### Separate chain output
+### Separate chain output (`--separate_chains`)
+
+VH and VL sequences separated by a comma:
 
 ```
-VH_SEQUENCE, VL_SEQUENCE
+EVQLVESGGGLVQPGG..., SYELTQPPSVSVSPGQ...
 ```
 
 ---
@@ -184,127 +257,3 @@ Ensure both ANARCI and HMMER are installed and available in `PATH`.
 This repository provides local inference for a finetuned version of p-IgGen.
 
 Upstream package: [https://github.com/OliverT1/p-IgGen](https://github.com/OliverT1/p-IgGen)
-
-## Overview
----
-
-This project presents a fine-tuned antibody Fv sequence generative model designed to produce sequences with CDR-H3 loops that are more structurally predictable and reliable. By training on sequences with accurately modelled H3 conformations, the model learns sequence patterns associated with increased structural determinism while preserving sequence diversity, enabling exploration of a broad antibody sequence space.
-
----
-
-## Data Curation
----
-
-### ColabFold
-ColabFold is run without MSA. Ten human paired antibody PDB structures were selected from SAbDab as templates. These were trimmed to Fv regions, insertion codes were removed, and CDR-H3 residues were masked.
-
----
-
-### SAbDab Sequences
-Human paired antibody–antigen complex structures were downloaded from SAbDab and filtered to retain only monomeric antibodies. Antibody sequences were extracted in FASTA format and trimmed to Fv regions.
-
-Sequences were modelled using ColabFold and compared to ground-truth bound conformations. CDR-H3 RMSD was calculated by aligning on the H3 loop and computing RMSD over Cα atoms.
-
-Sequences with H3 RMSD ≤ 1 Å were included in the training set.
-
----
-
-### OAS Sequences
-Human paired antibody Fv sequences from healthy donor B cells were obtained from OAS. Raw `.csv.gz` files were processed to extract full Fv and CDR-H3 sequences.
-
-Sequences were clustered at 99% H3 sequence identity using MMseqs2, retaining one sequence per cluster. These were modelled using ColabFold, and sequences with mean H3 pLDDT ≥ 80 were included in the training set.
-
----
-
-### Clustering
-Combined SAbDab and OAS sequences were clustered at 50% H3 sequence identity using MMseqs2. Data were split into training and validation sets (9:1) at the cluster level.
-
----
-
-## Model Training
----
-
-The dataset was used to fine-tune the p-IgGen model using LoRA.
-
-- Loss computed only on CDR-H3 residues  
-- H3 residue indices obtained from `loop.csv`  
-- Early stopping applied after three consecutive non-improving evaluations  
-
----
-
-## Inference
----
-
-- 200 unpaired sequences generated (temperature = 0.5)  
-- Sequences paired during preprocessing  
-
----
-
-## Evaluation
----
-
-### Structural Confidence and Accuracy
-- Mean H3 pLDDT (ColabFold)  
-- ABB2 per-residue error  
-- Framework-region pLDDT flanking H3  
-- H3–Fv Predicted Aligned Error (PAE)  
-
-### Structural Determinism
-- Mean pairwise H3 RMSD (multi-seed ColabFold)  
-- Structural clustering of H3 conformations  
-
-### Structural Rigidity
-- H3 loop length distribution  
-- ITsFlexible scores  
-- Fraction of rigid-like H3 loops  
-- CABS-flex RMSF  
-
-### Sequence Diversity
-- Internal nearest-neighbor identity  
-- Fraction of unique H3 sequences  
-
-### Novelty Analysis
-- Nearest-neighbor identity to training set  
-- Metrics evaluated at matched identity (pLDDT, RMSD)  
-
----
-
-## Results
----
-
-### Improved Structural Confidence and Accuracy
-- H3 pLDDT increased (65.2 → 74.4)  
-- ABB2 error decreased  
-- Framework pLDDT unchanged  
-- H3–Fv PAE decreased  
-
----
-
-### Increased Structural Determinism
-- Mean pairwise H3 RMSD decreased (1.43 Å → 0.749 Å)  
-- Single-cluster fraction increased (51% → 79.5%)  
-
----
-
-### Increased Structural Rigidity
-- Mean H3 length reduced (14.8 → 12.1 aa)  
-- ITsFlexible scores decreased (0.107 → 0.0516)  
-- Rigid-like fraction increased (9.0% → 27.5%)  
-- Mean H3 RMSF decreased (0.79 Å → 0.65 Å)  
-
----
-
-### Preserved Sequence Diversity
-- Internal NN identity unchanged (0.781 vs 0.776)  
-- Nearly all sequences remained unique (100% vs 99.0%)  
-
----
-
-### Improvements Beyond Sequence Similarity
-- NN identity to training set increased (0.436 → 0.505)  
-
-At matched identity:
-- H3 pLDDT remained higher  
-- H3 RMSD remained lower  
-
----
