@@ -12,15 +12,6 @@ The inference script supports:
 - Optional likelihood-based filtering of outputs
 - Optional separation of VH and VL chains
 
-## Features
-
-- Generate full-length antibody sequences
-- Generate light chains from heavy chains
-- Generate heavy chains from light chains
-- Generate sequences from an initial prompt
-- Filter generated sequences by likelihood
-- Output VH and VL chains separately
-
 ---
 
 ## Installation
