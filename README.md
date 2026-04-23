@@ -1,22 +1,8 @@
 # **Antibody Fv Generative Model for high accuracy prediction of CDR-H3 Loops**
 ---
-# Finetuned p-IgGen Inference
-
-This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen.
-
----
-
 ## Overview
 
-The inference script (`github_inference.py`) supports three distinct generation modes:
-
-- **Unconditional generation** — generate complete paired antibody sequences from scratch
-- **Conditional generation** — provide a known heavy or light chain and generate its paired partner
-- **Prompted generation** — provide a partial sequence and let the model continue from it
-
-Additional options:
-- Likelihood-based filtering to discard low-quality outputs
-- Separation of output into VH and VL chains via ANARCI
+This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen. Our Finetuned model is able to generate paried Fv sequences that has high CDR H3 loop prediction accuracy
 
 ---
 
