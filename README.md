@@ -33,13 +33,13 @@ pip install git+https://github.com/OliverT1/p-IgGen.git
 pip install torch transformers click
 ```
 
-### 4. (Optional) Install ANARCI (for VH/VL separation)
+### 4. Install ANARCI 
 
 ```bash
 conda install -c bioconda anarci
 ```
 
-### 5. (Optional) Install HMMER (required by ANARCI)
+### 5. Install HMMER 
 
 ```bash
 conda install -c bioconda hmmer
