@@ -1,8 +1,16 @@
 # **Antibody Fv Generative Model for high accuracy prediction of CDR-H3 Loops**
 ---
-## Overview
+# Finetuned p-IgGen Inference
 
-This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen. Our Finetuned model is able to generate paried Fv sequences that has high CDR H3 loop prediction accuracy
+This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen.
+
+The inference script supports:
+
+- Generation of full-length paired antibody sequences
+- Conditional generation from a provided heavy or light chain
+- Prompted generation from an initial sequence
+- Optional likelihood-based filtering of outputs
+- Optional separation of VH and VL chains
 
 ---
 
@@ -33,100 +41,50 @@ pip install git+https://github.com/OliverT1/p-IgGen.git
 pip install torch transformers click
 ```
 
-### 4. Install ANARCI 
+### 4. Install HMMER (required by ANARCI)
 
 ```bash
-conda install -c bioconda anarci
+conda install -n piggen_infer -c bioconda hmmer -y
 ```
 
-### 5. Install HMMER 
+### 5. Install ANARCI
 
 ```bash
-conda install -c bioconda hmmer
+conda install -n piggen_infer -c bioconda anarci -y
 ```
+
+If the conda ANARCI install fails with an `UnsatisfiableError`, use:
+
+```bash
+conda run -n piggen_infer pip install anarci
+```
+
+> Note: This inference script imports ANARCI at startup, so ANARCI must be installed
+> even if you are not using `--separate_chains`.
 
 ---
 
 ## Inference Script
 
-Download the inference script directly from this repository:
-
-```bash
-wget https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py -O github_inference.py
-```
-
-Or with curl:
-
-```bash
-curl -o github_inference.py https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py
-```
+Save the inference script as `github_inference.py`.
 
 ---
 
-## Generation Modes
+## Usage
 
-### 1. Unconditional generation
-
-Generate complete paired antibody sequences from scratch, with no input conditioning. The model samples freely from its learned distribution.
+Run inference:
 
 ```bash
-python github_inference.py \
-  --n_sequences 10 \
-  --output_file output_sequences.txt
+python github_inference.py --output_file output_sequences.txt
 ```
 
----
-
-### 2. Conditional generation from a heavy chain
-
-Provide a file of known heavy chain sequences (one per line). For each heavy chain, the model generates a paired light chain. The heavy chain is used as a prefix prompt (`1{heavy_chain}`) and the model generates the remainder of the paired sequence.
-
-```bash
-python github_inference.py \
-  --heavy_chain_file heavy_chains.txt \
-  --n_sequences 5 \
-  --output_file output_sequences.txt
-```
-
-Output format: `index, generated_light_chain`
-
----
-
-### 3. Conditional generation from a light chain
-
-The reverse of the above — provide known light chain sequences and the model generates a paired heavy chain for each. Internally the model runs in backwards mode, reversing the light chain and generating the heavy chain in the reverse direction.
-
-```bash
-python github_inference.py \
-  --light_chain_file light_chains.txt \
-  --n_sequences 5 \
-  --output_file output_sequences.txt
-```
-
-Output format: `index, generated_heavy_chain`
-
-> **Note:** `--heavy_chain_file` and `--light_chain_file` are mutually exclusive — passing both will raise an error.
-
----
-
-### 4. Prompted generation from an initial sequence
-
-Provide the beginning of a sequence and the model will continue generating from it. This is open-ended generation — unlike the chain file modes, no pairing logic is applied. The model treats your input as a raw sequence prefix and samples forward from that point.
-
-The example below uses a partial heavy chain as the prompt:
-
-```bash
-python github_inference.py \
-  --initial_sequence QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKG \
-  --n_sequences 20 \
-  --top_p 0.9 \
-  --temp 1.1 \
-  --output_file output_sequences.txt
-```
-
-This generates 20 sequences that all begin with `QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKG`, with slightly tighter sampling than the defaults (`--top_p 0.9` vs `0.95`, `--temp 1.1` vs `1.2`), producing more conservative completions while still maintaining diversity.
-
-Output format: one complete sequence per line.
+> **Notes**
+> - Generation uses sampling (`do_sample=True`)
+> - `max_new_tokens` is fixed at 400
+> - `bottom_n_percent` only applies when `n_sequences >= 100`
+> - GPU is used automatically if available
+> - Some generated samples can be dropped by post-generation validation, so written
+>   output count may be lower than `--n_sequences`
 
 ---
 
@@ -134,78 +92,78 @@ Output format: one complete sequence per line.
 
 ### Model and tokenizer
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--model_name` | TEXT | `Wu1234sdsd/piggen-merged-finetuned` | Hugging Face model repo or local path to load the finetuned model from |
-| `--tokenizer_name` | TEXT | `ollieturnbull/p-IgGen` | Hugging Face tokenizer repo or local path. Should generally be left as default unless using a custom tokenizer |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--model_name TEXT` | Hugging Face model or local path | `Wu1234sdsd/piggen-merged-finetuned` |
+| `--tokenizer_name TEXT` | Tokenizer repository or path | `ollieturnbull/p-IgGen` |
 
 ### Input conditioning
 
-Exactly one of the following may be provided. If none are given, the model generates unconditionally.
+| Flag | Description |
+|------|-------------|
+| `--heavy_chain_file TEXT` | File containing heavy chain sequences (one per line) |
+| `--light_chain_file TEXT` | File containing light chain sequences (one per line) |
+| `--initial_sequence TEXT` | Initial sequence prompt |
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--heavy_chain_file` | TEXT | None | Path to a file of heavy chain sequences, one per line. For each sequence, the model generates `--n_sequences` paired light chains |
-| `--light_chain_file` | TEXT | None | Path to a file of light chain sequences, one per line. For each sequence, the model generates `--n_sequences` paired heavy chains using backwards generation |
-| `--initial_sequence` | TEXT | None | A partial sequence to use as a generation prompt. The model will continue the sequence from this prefix. Cannot be combined with `--heavy_chain_file` or `--light_chain_file` |
+For p-IgGen forward prompting, prefix the prompt with `1`.
+Example: `--initial_sequence 1QVQLVES...`
 
 ### Sampling
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--n_sequences` | INTEGER | `1` | Number of sequences to generate. When using `--heavy_chain_file` or `--light_chain_file`, this is the number of sequences generated **per input chain** |
-| `--top_p` | FLOAT | `0.95` | Nucleus sampling threshold. At each generation step, only tokens whose cumulative probability reaches `top_p` are considered. Lower values (e.g. `0.8`) make outputs more focused and conservative; higher values allow more diversity |
-| `--temp` | FLOAT | `1.2` | Sampling temperature. Higher values (e.g. `1.4`) increase randomness and sequence diversity; lower values (e.g. `0.9`) make the model more deterministic and likely to produce higher-probability sequences |
-| `--bottom_n_percent` | INTEGER | `5` | Percentage of generated sequences to discard based on model log-likelihood. Only applied when `--n_sequences >= 100`. For example, `--bottom_n_percent 10` discards the lowest-scoring 10% of outputs, returning the top 90% |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--n_sequences INTEGER` | Number of sequences to generate | `1` |
+| `--top_p FLOAT` | Top-p nucleus sampling | `0.95` |
+| `--temp FLOAT` | Sampling temperature | `1.2` |
+| `--bottom_n_percent INTEGER` | Percentage of lowest-likelihood sequences to discard (only used if `n_sequences >= 100`) | `5` |
 
 ### Generation control
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--backwards` | FLAG | False | Generate sequences in the reverse direction. Used internally by `--light_chain_file` mode. Can also be set manually for custom backwards generation workflows |
-| `--separate_chains` | FLAG | False | After generation, use ANARCI to split outputs into separate VH and VL chains. Requires ANARCI and HMMER to be installed. Only applies to unconditional or prompted generation — not compatible with `--heavy_chain_file` or `--light_chain_file` modes |
+| Flag | Description |
+|------|-------------|
+| `--backwards` | Generate sequences in reverse direction |
+| `--separate_chains` | Output VH and VL separately (requires ANARCI) |
 
 ### Output
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--output_file` | TEXT | — | Path to write output sequences. **Required.** |
+| Flag | Description |
+|------|-------------|
+| `--output_file TEXT` | Output file path (required) |
 
 ### Runtime
 
-| Flag | Type | Default | Description |
-|------|------|---------|-------------|
-| `--cache_dir` | TEXT | None | Directory for caching Hugging Face model and tokenizer downloads. Useful if you want to store model weights in a specific location or reuse a previously downloaded model |
-| `--device` | TEXT | None | Device to run inference on (`cuda`, `mps`, or `cpu`). If not specified, the script automatically selects the best available device in order: `cuda` → `mps` → `cpu` |
+| Flag | Description |
+|------|-------------|
+| `--cache_dir TEXT` | Hugging Face cache directory |
+| `--device TEXT` | Device to run inference on |
+
+Automatically selects: `cuda` → `mps` → `cpu`
+
+If CUDA is detected but unsupported by your GPU/PyTorch build, run with:
+`--device cpu`
 
 ---
 
 ## Output Format
 
-### Unconditional / prompted generation
-
-One complete sequence per line:
+### Default output
 
 ```
-EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYGMHWVRQAPGKGLEWVSYISSSGSTIYYADSVKGRFTISRDNAKNSLYLQMNSLRAEDTAVYYCAREDYYGMDVWGQGTTVTVSSQSALTQPASVSGSPGQSITISCTGTSSDVGSYNLVSWYQQHPGKAPKLMIYEG
-QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKGLEWVSYISSSGSTIYVADSVKGRFTISRDNSKNTLYLQMNSLRAEDTAVYYCAREDYYGMDVWGQGTTVTVSSQSALTQPASVSGSAGQSITISCTGTSSDVGSYNLVSWYQQHPGKAPKLMIY
+SEQUENCE_1
+SEQUENCE_2
+SEQUENCE_3
 ```
 
-### Conditional generation (heavy or light chain file)
-
-Index of the input chain followed by the generated partner chain:
+### Conditional generation output
 
 ```
-0, SYELTQPPSVSVSPGQTARITCSGDALPKQYAYWYQQKSGQAPVLVIYKDSERPSGIPERFSGSNSGNTATLTISGTQAMDEADYYCQSADSSGTYVFGTGTKVTVL
-1, SYELTQPPSVSVSPGQTARITCSGDALPKQYAYWYQQKSGQAPVLVIYKDSERPSGIPERFSGSNSGNTATLTISGTQAMDEADYYCQSADSSGTYVFGTGTKVTVL
+index, generated_sequence
 ```
 
-### Separate chain output (`--separate_chains`)
-
-VH and VL sequences separated by a comma:
+### Separate chain output
 
 ```
-EVQLVESGGGLVQPGG..., SYELTQPPSVSVSPGQ...
+VH_SEQUENCE, VL_SEQUENCE
 ```
 
 ---
@@ -224,17 +182,24 @@ python github_inference.py --help
 
 **ANARCI not found**
 ```bash
-conda install -c bioconda anarci
+conda install -n piggen_infer -c bioconda anarci -y
+# If that fails:
+conda run -n piggen_infer pip install anarci
 ```
 
 **`hmmscan` not found**
 ```bash
-conda install -c bioconda hmmer
+conda install -n piggen_infer -c bioconda hmmer -y
 ```
 
 **`--separate_chains` not working**
 
 Ensure both ANARCI and HMMER are installed and available in `PATH`.
+
+**Prompted generation returns 0 sequences**
+
+Use `--initial_sequence` with a leading `1` token (for example,
+`--initial_sequence 1QVQLVES...`).
 
 ---
 
