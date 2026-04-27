@@ -66,7 +66,76 @@ conda run -n piggen_infer pip install anarci
 
 ## Inference Script
 
-Save the inference script as `github_inference.py`.
+Download the inference script:
+
+```bash
+wget https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py -O github_inference.py
+```
+
+Or with curl:
+
+```bash
+curl -o github_inference.py https://raw.githubusercontent.com/psipred/Antibody-design/main/operations/user_inference.py
+```
+
+## Generation Modes (Examples)
+
+### 1. Unconditional generation
+
+```bash
+python github_inference.py \
+  --n_sequences 10 \
+  --output_file output_unconditional.txt \
+  --device cpu
+```
+
+### 2. Conditional generation from heavy chains (heavy -> light)
+
+Input file format (`heavy_chains.txt`): one heavy chain per line.
+
+```bash
+python github_inference.py \
+  --heavy_chain_file heavy_chains.txt \
+  --n_sequences 5 \
+  --top_p 0.95 \
+  --temp 1.2 \
+  --output_file output_from_heavy.txt \
+  --device cpu
+```
+
+Output format: `index, generated_light_chain`
+
+### 3. Conditional generation from light chains (light -> heavy)
+
+Input file format (`light_chains.txt`): one light chain per line.
+
+```bash
+python github_inference.py \
+  --light_chain_file light_chains.txt \
+  --n_sequences 5 \
+  --top_p 0.95 \
+  --temp 1.2 \
+  --output_file output_from_light.txt \
+  --device cpu
+```
+
+Output format: `index, generated_heavy_chain`
+
+### 4. Prompted generation from an initial sequence
+
+For forward prompting, prefix the prompt with `1`.
+
+```bash
+python github_inference.py \
+  --initial_sequence 1QVQLVESGGGVVQPGRSLRLSCAASGFTFSSYGMHWVRQAPGKG \
+  --n_sequences 20 \
+  --top_p 0.9 \
+  --temp 1.1 \
+  --output_file output_prompted.txt \
+  --device cpu
+```
+
+> `--heavy_chain_file` and `--light_chain_file` are mutually exclusive.
 
 ---
 
