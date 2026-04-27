@@ -10,7 +10,8 @@ The inference script supports:
 - Conditional generation from a provided heavy or light chain
 - Prompted generation from an initial sequence
 - Optional likelihood-based filtering of outputs
-- Optional separation of VH and VL chains
+- Optional separation of VH and VL chains in outputs
+- Optional reverse generation
 
 ---
 
@@ -126,7 +127,7 @@ Example: `--initial_sequence 1QVQLVES...`
 
 > **Notes**
 > - The model samples next tokens probabilistically instead of always picking the single most likely token, giving diversity across outputs
-> - Each generated sequence can add at most 400 new tokens 
+> - Each generation (not including prompt) can add at most 400 new tokens 
 > - `bottom_n_percent` only applies when `n_sequences >= 100`
 > - Some generated samples can be dropped by post-generation validation, so written
 >   output count may be lower than `--n_sequences`
