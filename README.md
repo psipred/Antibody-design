@@ -1,7 +1,5 @@
 # **Antibody Fv Generative Model for high accuracy prediction of CDR-H3 Loops**
 ---
-# Inference
-
 This repository provides a local inference workflow for our finetuned antibody language model based on p-IgGen.
 
 The inference script supports:
