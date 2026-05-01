@@ -10,6 +10,10 @@ The inference script supports:
 - Optional likelihood-based filtering of outputs
 - Optional separation of VH and VL chains in outputs
 - Optional reverse generation
+---
+<img width="3619" height="2959" alt="inference_eval_diagram" src="https://github.com/user-attachments/assets/dc62fb77-ec30-486c-95d5-e587d2fd2dc0" />
+<img width="880" height="758" alt="截屏2026-05-01 20 56 34" src="https://github.com/user-attachments/assets/dcf2a4ad-5631-4f0f-8d67-f7b57608d12c" />
+
 
 ---
 
