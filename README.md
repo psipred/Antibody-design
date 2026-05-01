@@ -11,7 +11,8 @@ The inference script supports:
 - Optional separation of VH and VL chains in outputs
 - Optional reverse generation
 ---
-All scripts for finetune data curation, training, inference and evaluation can be found at. he diagrams below map the data flow through the fine-tuning data curation and inference/pre-evaluation pipelines, tracing how each script's inputs and outputs connect. Model training and evaluation are omitted as their workflows are comparatively straightforward
+All scripts for finetune data curation, training, inference and evaluation can be found at psipred/Antibody-design/main/scripts. The diagrams below map the data flow through the fine-tuning data curation and inference/pre-evaluation pipelines, tracing how each script's inputs and outputs connect. Model training and evaluation are omitted as their workflows are comparatively straightforward
+
 Finetune data curation
 <img width="880" height="758" alt="截屏2026-05-01 20 56 34" src="https://github.com/user-attachments/assets/dcf2a4ad-5631-4f0f-8d67-f7b57608d12c" />
 Inference and pre-evaluation
