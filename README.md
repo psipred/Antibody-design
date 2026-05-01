@@ -14,7 +14,7 @@ The inference script supports:
 All scripts for finetune data curation, training, inference and evaluation can be found at psipred/Antibody-design/main/scripts. The diagrams below map the data flow through the fine-tuning data curation and inference/pre-evaluation pipelines, tracing how each script's inputs and outputs connect. Model training and evaluation are omitted as their workflows are comparatively straightforward
 
 Finetune data curation
-<img width="7016" height="4958" alt="sdsdq" src="https://github.com/user-attachments/assets/8cb82bc5-5cce-43c7-8259-ff52a5f772ce" />
+<img width="3749" height="3427" alt="sdsdq-2" src="https://github.com/user-attachments/assets/e6f68395-7b5e-4955-82a6-5e18adca69c9" />
 Inference and pre-evaluation
 <img width="3619" height="2959" alt="inference_eval_diagram" src="https://github.com/user-attachments/assets/dc62fb77-ec30-486c-95d5-e587d2fd2dc0" />
 
