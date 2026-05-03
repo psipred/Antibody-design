@@ -54,12 +54,6 @@ conda install -n piggen_infer -c bioconda hmmer -y
 ### 5. Install ANARCI
 
 ```bash
-conda install -n piggen_infer -c bioconda anarci -y
-```
-
-If the conda ANARCI install fails with an `UnsatisfiableError`, use:
-
-```bash
 conda run -n piggen_infer pip install anarci
 ```
 
