@@ -165,11 +165,6 @@ class CustomPIgGen:
             new_valid = [utils.format_and_validate_output(s) for s in raw]
             new_valid = [s for s in new_valid if s is not None]
             decoded_sequences.extend(new_valid)
-            if len(decoded_sequences) < n_to_collect:
-                logger.info(
-                    "Attempt %d/%d: %d/%d valid sequences so far; retrying.",
-                    attempt + 1, MAX_ATTEMPTS, len(decoded_sequences), n_to_collect,
-                )
         decoded_sequences = decoded_sequences[:n_to_collect]
 
         if len(decoded_sequences) < n_to_collect:
