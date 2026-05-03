@@ -3,7 +3,8 @@ data/
 model_output/
 models/
 evaluation_metrics/
-operations/
+/operations/*
+!/operations/user_inference.py
 /inference/
 immunebuilder_output/
 
