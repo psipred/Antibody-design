@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """
-CDR H3 Flexibility Analysis
-============================
-Extracts CDR H3 RMSF from CABSflex outputs and produces:
-  1. Violin plot of mean CDR H3 RMSF (baseline vs finetuned)
-  2. Per-residue mean RMSF line plot across H3 positions (baseline vs finetuned)
+CDR H3 Flexibility Analysis — CABSflex RMSF comparison
+========================================================
+Reads CABSflex per-residue RMSF outputs for two groups of antibody structures
+(baseline vs fine-tuned model) and produces two publication-quality plots:
 
-RMSF.csv format expected:
-    A1    1.350
-    A2    0.734
-    ...
-    B1    0.500
-    ...
-Where A = heavy chain, B = light chain.
+  1. Violin plot  — distribution of *mean* CDR H3 RMSF per antibody,
+                    with Mann-Whitney U significance annotation.
+  2. Per-residue line plot — mean RMSF at each H3 position (H3-1 … H3-N),
+                              averaged across all antibodies in each group.
 
-CDR H3 is identified from ANARCI chothia numbering (positions 95-102 on heavy chain).
+Inputs
+------
+  BASELINE_DIR / FINETUNED_DIR : root directories, one subdirectory per
+      antibody, each containing a CABSflex output tree with plots/RMSF.csv.
+  BASELINE_ANARCI / FINETUNED_ANARCI : ANARCI output files in Chothia scheme,
+      used to map each antibody's sequential chain-A residue indices to Chothia
+      positions so H3 can be identified in RMSF.csv.
+
+Outputs (written to PLOT_DIR)
+-------------------------------
+  cdr_h3_rmsf_violin.png      — violin plot with significance bracket
+  cdr_h3_rmsf_per_residue.png — per-position mean RMSF line plot
+  cdr_h3_rmsf_summary.csv     — flat table of (group, mean_h3_rmsf) rows
+
 """
 
 import os
@@ -25,6 +34,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from scipy.stats import mannwhitneyu
+
+plt.rcParams.update({'font.size': 14})
 
 # ---------------------------------------------------------------------------
 # CONFIGURE THESE
@@ -80,7 +91,7 @@ def find_rmsf_file(job_dir):
     path = os.path.join(job_dir, "plots", "RMSF.csv")
     if os.path.exists(path):
         return path
-    # Fallback: search recursively
+    # Fallback: search recursively in case CABSflex placed output in a non-standard subdirectory
     candidates = glob.glob(os.path.join(job_dir, "**", "RMSF.csv"), recursive=True) + \
                  glob.glob(os.path.join(job_dir, "**", "rmsf.csv"), recursive=True)
     return candidates[0] if candidates else None
@@ -102,7 +113,9 @@ def parse_anarci(filepath):
         for line in f:
             line = line.strip()
 
-            # New antibody block
+            # ANARCI files use "# <name>" for antibody headers but also use "#" for
+            # metadata lines (species, scheme, HMM score, etc.).  The negative-list
+            # rejects all known metadata patterns so we only trigger on true ID lines.
             if line.startswith("# ") and not any(x in line for x in
                     ["ANARCI", "Domain", "Most", "species", "Scheme", "e-value",
                      "numbered", "significant", "HMM", "|"]):
@@ -116,6 +129,7 @@ def parse_anarci(filepath):
             if line.startswith("#") or line == "":
                 continue
 
+            # "//" marks end-of-record in ANARCI output
             if line == "//":
                 if current_ab is not None:
                     ab_data[current_ab] = current_residues
@@ -125,6 +139,9 @@ def parse_anarci(filepath):
                 continue
 
             # Residue line: "H 95      C" or "H 95A     -"
+            # Column 0: chain type (H = heavy, L = light); we only want H here
+            # Column 1: Chothia position (may have insertion code like "95A")
+            # Column 2: amino acid ("-" = gap/deletion in the numbering scheme)
             parts = line.split()
             if len(parts) >= 3 and parts[0] == "H":
                 num_str = parts[1]
@@ -133,6 +150,8 @@ def parse_anarci(filepath):
                 if num_match:
                     chothia_num = int(num_match.group(1))
                     if aa != "-":
+                        # Only increment seq_index for real residues; gaps don't
+                        # consume a sequential position in the structure/RMSF file.
                         seq_index += 1
                         current_residues.append((chothia_num, num_str, aa, seq_index))
 
@@ -168,7 +187,9 @@ def extract_ab_id(job_folder_name):
 def load_group(cabsflex_dir, anarci_file, group_name):
     anarci_data = parse_anarci(anarci_file)
     mean_h3_rmsf = []
-    per_position = defaultdict(list)  # relative H3 position -> list of RMSF values
+    # per_position maps relative H3 index (1 = first H3 residue) to a list of
+    # RMSF values across all antibodies, enabling per-position averaging later.
+    per_position = defaultdict(list)
     skipped = []
 
     job_dirs = sorted([
@@ -205,6 +226,9 @@ def load_group(cabsflex_dir, anarci_file, group_name):
             key = (HEAVY_CHAIN, seq_idx)
             if key in rmsf:
                 h3_rmsf_vals.append(rmsf[key])
+                # Accumulate per-position for the line plot; rel_pos is consistent
+                # across antibodies of the same H3 length but not across different
+                # lengths — the line plot therefore averages over all lengths combined.
                 per_position[rel_pos].append(rmsf[key])
 
         if not h3_rmsf_vals:
@@ -235,6 +259,8 @@ def plot_violin(baseline_vals, finetuned_vals, outpath):
     labels = ["Baseline", "Finetuned"]
     colors = ["#f5c87a", "#a8c8e8"]
 
+    # showmedians/showextrema are disabled because we annotate the median
+    # manually with exact numeric values for precision.
     parts = ax.violinplot(data, positions=[1, 2], widths=0.6,
                           showmedians=False, showextrema=False)
 
@@ -247,9 +273,11 @@ def plot_violin(baseline_vals, finetuned_vals, outpath):
     for vals, pos in zip(data, [1, 2]):
         median = np.median(vals)
         ax.text(pos, median + 0.02, "{:.2f} \u00c5".format(median),
-                ha="center", va="bottom", fontsize=11)
+                ha="center", va="bottom", fontsize=14)
 
     # Mann-Whitney U significance test (Baseline vs Finetuned)
+    # Non-parametric test chosen because RMSF values are not normally distributed
+    # (right-skewed, bounded at zero).  two-sided tests for any difference.
     _, pvalue = mannwhitneyu(baseline_vals, finetuned_vals, alternative="two-sided")
     if pvalue < 0.001:
         sig_label = "***"
@@ -260,18 +288,18 @@ def plot_violin(baseline_vals, finetuned_vals, outpath):
     else:
         sig_label = "ns"
 
+    # Draw significance bracket above the tallest violin
     y_data_max = max(np.max(baseline_vals), np.max(finetuned_vals))
     bracket_y = y_data_max + 0.08
     bracket_h = 0.04
     text_y = bracket_y + bracket_h + 0.01
     ax.plot([1, 1, 2, 2], [bracket_y, bracket_y + bracket_h, bracket_y + bracket_h, bracket_y], c="black", lw=1.2)
-    ax.text(1.5, text_y, sig_label, ha="center", va="bottom", fontsize=12)
+    ax.text(1.5, text_y, sig_label, ha="center", va="bottom", fontsize=14)
     print("Mann-Whitney U (Baseline vs Finetuned): p={:.6g} ({})".format(pvalue, sig_label))
 
     ax.set_xticks([1, 2])
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.set_ylabel("Mean CDR H3 RMSF [\u00c5]", fontsize=12)
-    ax.set_title("CDR H3 Loop Rigidity", fontsize=13)
+    ax.set_xticklabels(labels, fontsize=14)
+    ax.set_ylabel("Mean CDR H3 RMSF [\u00c5]", fontsize=14)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.set_xlim(0.3, 2.7)
@@ -288,6 +316,8 @@ def plot_violin(baseline_vals, finetuned_vals, outpath):
 # ---------------------------------------------------------------------------
 
 def plot_per_residue(baseline_pos, finetuned_pos, outpath):
+    # Union of all positions seen in either group; some may be absent in one
+    # group if H3 lengths differ (e.g. no antibody in group A has a 10-residue H3).
     all_positions = sorted(set(list(baseline_pos.keys()) + list(finetuned_pos.keys())))
 
     baseline_means  = [np.mean(baseline_pos[p])  if p in baseline_pos  else np.nan for p in all_positions]
@@ -304,11 +334,10 @@ def plot_per_residue(baseline_pos, finetuned_pos, outpath):
             markersize=3, linewidth=1.0, label="Finetuned")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
-    ax.set_ylabel("RMSF", fontsize=11)
-    ax.set_xlabel("CDR H3 Residue Position", fontsize=11)
-    ax.set_title("Mean CDR H3 RMSF per Residue", fontsize=12)
-    ax.legend(frameon=False, fontsize=10)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=14)
+    ax.set_ylabel("RMSF", fontsize=14)
+    ax.set_xlabel("CDR H3 Residue Position", fontsize=14)
+    ax.legend(frameon=False, fontsize=14)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.set_ylim(bottom=0)

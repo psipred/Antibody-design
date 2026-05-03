@@ -1,3 +1,49 @@
+"""
+OAS near-redundancy clustering: pool multiple paired-Fv datasets, cluster on
+CDRH3 at high identity, pick one representative per cluster, and optionally
+exclude sequences from a specific OAS batch.
+
+Overview
+--------
+This script is used to de-replicate OAS (Observed Antibody Space) healthy-donor
+paired-Fv sequences before they are used for downstream ColabFold structure
+prediction. The goal is to avoid computing AlphaFold predictions for sequences
+that are nearly identical to each other (wasteful) while preserving diversity
+at the antigen-binding CDRH3 level.
+
+Pipeline
+--------
+1. Load paired Fv FASTA (VH:VL) and CDR FASTA (all six CDR loops) for each
+   OAS dataset batch.
+2. Find the intersection of IDs that have both a full Fv sequence and a CDRH3
+   sequence — only these are included.
+3. Pool all datasets into a single CDRH3 FASTA, handling ID collisions across
+   batches by appending a dataset tag.
+4. Run MMseqs2 easy-cluster at 99% sequence identity / 90% coverage on CDRH3.
+   High identity (99%) retains near-identical sequences as cluster members
+   while still deduplicating exact or near-exact duplicates. Coverage mode 0
+   requires both sequences to meet the coverage threshold (vs. only the shorter
+   one in mode 1).
+5. For each cluster, select one representative. If any member comes from a
+   dataset other than EXCLUDE_TAG (1287155_1), prefer that member; otherwise
+   drop the entire cluster.
+   Rationale: batch 1287155_1 is reserved for pLDDT-filtered training data;
+   its representatives are intentionally excluded here so the output FASTA
+   does not overlap with that batch's structure predictions.
+6. Write the selected representatives' full Fv sequences to the output FASTA.
+
+Inputs
+------
+  DATASETS: list of dicts with 'tag', 'fv_fasta' (paired VH:VL), 'cdr_fasta'
+            (all CDR loops for the same entries).
+
+Outputs
+-------
+  OUT_FASTA: paired_fv_trimmed_h3mmseq99_cov0.9_rep_combined_no1287155.fasta
+             One Fv sequence per CDRH3 cluster (excluding 1287155_1 batch).
+
+"""
+
 #!/usr/bin/env python3
 
 import shutil
@@ -26,7 +72,7 @@ DATASETS = [
 
 MIN_SEQ_ID = 0.99
 COVERAGE   = 0.90
-COV_MODE   = 0
+COV_MODE   = 0   # both sequences must meet the coverage threshold
 
 # Final output AFTER:
 # 1) pooling all datasets
@@ -37,8 +83,10 @@ OUT_FASTA = Path(
     "/home/alanwu/Documents/iggen_model/data/oas data/vh_vl/native_healthy/paired_fv_trimmed_h3mmseq99_cov0.9_rep_combined_no1287155.fasta"
 )
 
-# no spaces for mmseqs temp work
+# MMseqs2 requires paths without spaces; use a safe working directory
 SAFE_TMP_ROOT = Path("/home/alanwu/Documents/iggen_model/tmp_mmseqs_h3_cluster_combined")
+
+# This batch is intentionally excluded from the final output (see module docstring)
 EXCLUDE_TAG = "1287155_1"
 # =========================================
 
@@ -51,6 +99,10 @@ def run(cmd: list[str]):
 def normalize_base_id(s: str) -> str:
     """
     Normalize IDs so FV and CDR files can match.
+
+    OAS FASTA headers contain pipe-separated suffixes like '|VH:VL' or '|CDRH3'
+    and sometimes whitespace. Stripping to just the base ID before the first '|'
+    allows cross-file joins without false negatives from suffix mismatches.
 
     Examples:
       AAAC...__...|VH:VL  -> AAAC...__...
@@ -87,7 +139,12 @@ def load_fv_fasta(path: Path) -> dict[str, str]:
 
 def load_cdrh3_only(path: Path) -> dict[str, str]:
     """
-    From cdr_loops.fasta, keep only entries ending with |CDRH3
+    From cdr_loops.fasta, keep only entries ending with |CDRH3.
+
+    The CDR FASTA contains all six CDR loops per antibody, each with its own
+    header line. Only CDRH3 is needed for clustering since it is the primary
+    determinant of antigen binding specificity.
+
     Return:
       {base_id: h3_seq}
     """
@@ -107,6 +164,9 @@ def unique_id(rid: str, used: set[str], tag: str) -> str:
     """
     Preserve original ID if unique.
     If duplicated across datasets, append |tag, then |tag|2, etc.
+
+    This handles the case where the same antibody sequence appears in two
+    different OAS study batches with identical base IDs.
     """
     if rid not in used:
         return rid
@@ -119,6 +179,7 @@ def unique_id(rid: str, used: set[str], tag: str) -> str:
 
 
 def main():
+    # Always start with a clean temporary directory to avoid stale MMseqs2 files
     if SAFE_TMP_ROOT.exists():
         shutil.rmtree(SAFE_TMP_ROOT)
     SAFE_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -130,9 +191,9 @@ def main():
             "mmseqs not found or not runnable. Try `which mmseqs` and `mmseqs version`."
         ) from e
 
-    pooled_fv_map: dict[str, str] = {}
-    pooled_h3_map: dict[str, str] = {}
-    id_source_map: dict[str, str] = {}
+    pooled_fv_map: dict[str, str] = {}    # final_id -> full VH:VL sequence
+    pooled_h3_map: dict[str, str] = {}    # final_id -> CDRH3 sequence
+    id_source_map: dict[str, str] = {}    # final_id -> dataset tag (for exclusion logic)
     used_ids: set[str] = set()
 
     total_fv_loaded = 0
@@ -160,6 +221,7 @@ def main():
 
         fv_ids = set(fv_map_raw.keys())
         h3_ids = set(h3_map_raw.keys())
+        # Only entries with both a full Fv AND a CDRH3 can be used
         shared_ids = sorted(fv_ids & h3_ids)
         total_shared += len(shared_ids)
 
@@ -176,6 +238,7 @@ def main():
         for x in list(sorted(h3_ids))[:5]:
             print(f"    {x}")
 
+        # If no IDs overlap, print diagnostic samples to help debug ID format mismatches
         if len(shared_ids) == 0:
             print("  Example FV-only IDs:")
             for x in list(sorted(fv_ids - h3_ids))[:5]:
@@ -207,7 +270,7 @@ def main():
     print(f"Total shared raw IDs:    {total_shared}")
     print(f"Total pooled sequences:  {len(all_ids)}")
 
-    # write pooled H3 FASTA to a no-space temp path for mmseqs
+    # MMseqs2 fails on paths containing spaces, so write to SAFE_TMP_ROOT
     safe_h3_fasta = SAFE_TMP_ROOT / "combined_h3_input.fasta"
     write_fasta_wrapped(safe_h3_fasta, pooled_h3_map, all_ids)
 
@@ -231,7 +294,7 @@ def main():
     if not tsv_path.exists():
         raise RuntimeError(f"Expected cluster TSV not found: {tsv_path}")
 
-    # representative -> members
+    # Build cluster dict: representative -> [member1, member2, ...]
     clusters: dict[str, list[str]] = {}
     with tsv_path.open("r") as f:
         for line in f:
@@ -241,6 +304,7 @@ def main():
     # Pick one sequence per cluster, but exclude 1287155_1 from the final population.
     # If a cluster has at least one non-1287155_1 member, keep the first such member.
     # If every member in the cluster is from 1287155_1, drop the whole cluster.
+    # This ensures the output set does not overlap with the reserved training batch.
     final_ids = []
     dropped_clusters_all_excluded = 0
 

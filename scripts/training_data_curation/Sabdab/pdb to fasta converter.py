@@ -1,3 +1,59 @@
+"""
+Extract paired Fv sequences from Chothia-numbered SAbDab PDB files.
+
+Overview
+--------
+This script converts SAbDab antibody PDB structures into a paired FASTA file
+suitable for ColabFold structure prediction and downstream training data
+curation. For each PDB file, it:
+  1. Reads the REMARK record to identify the heavy (H) and light (L) chain IDs.
+  2. Extracts the amino acid sequence for each chain using BioPython's PPBuilder.
+  3. Trims both chains to the variable domain boundary using Chothia numbering:
+       VH: up to and including residue 113
+       VL: up to and including residue 107
+  4. Writes the trimmed VH and VL sequences in paired FASTA format (VH:VL).
+
+Why trim at Chothia 113 / 107?
+-------------------------------
+SAbDab PDB structures from the Chothia-renumbered set may include the constant
+domain (CH1/CL) residues beyond the variable domain. Trimming at position 113
+(VH) and 107 (VL) retains only the variable domain, which is the region used
+for antigen binding and the target of the IgGen model. This also makes all
+input sequences structurally comparable regardless of whether the crystal
+structure includes part of the constant domain.
+
+Chain disambiguation
+--------------------
+SAbDab REMARK records contain a PAIRED_HL annotation, e.g.:
+  REMARK 950 PAIRED_HL HCHAIN=H LCHAIN=L
+In rare cases, the REMARK assigns both chains to the same letter (e.g., A/A),
+which can happen when the two chains use case-sensitive chain IDs (A and a).
+In those cases, `resolve_fallback_chain_ids` tries both the uppercase and
+lowercase variant of the chain letter, extracts the sequence for each, and
+classifies VH vs VL using the spacing between the two conserved cysteines.
+
+VH vs VL classification by cysteine spacing
+--------------------------------------------
+The variable domain fold contains two conserved cysteines (forming the
+intra-domain disulfide bond). Their spacing differs between VH and VL:
+  - VL: ~65 residues between cysteine 1 (~pos 23) and cysteine 2 (~pos 88)
+  - VH: > 70 residues between cysteine 1 (~pos 22) and cysteine 2 (~pos 92–104)
+A distance of 60–70 is classified as VL; anything else as VH.
+If fewer than 2 cysteines are found, length is used as a proxy (>110 → VH).
+
+Inputs
+------
+  chothia_dir : Directory of *_chothia.pdb files from SAbDab.
+
+Outputs
+-------
+  single_fv_pdb.fasta : Paired VH:VL FASTA; one entry per successfully processed
+                        antibody. Format:
+                          >{pdb_id}|VH:VL
+                          {VH_trimmed}:{VL_trimmed}
+
+"""
+
 from Bio.PDB import PDBParser, PPBuilder
 import glob, os, re
 
@@ -26,6 +82,11 @@ def classify_vh_vs_vl(seq):
 
 
 def extract_sequence_from_chain(chothia_path, chain_id):
+    """
+    Extract the amino acid sequence for a single chain from a PDB file.
+    PPBuilder builds polypeptide fragments; joining them handles chain breaks
+    (missing residues) without losing the sequence context.
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("antibody", chothia_path)
 
@@ -41,6 +102,17 @@ def extract_sequence_from_chain(chothia_path, chain_id):
 
 
 def get_chothia_cutoff(chothia_path, chain_id, limit):
+    """
+    Count the number of ATOM residues in 'chain_id' with Chothia resSeq ≤ limit.
+
+    This produces the correct trim length even when the Chothia numbering has
+    gaps (deleted residues) or insertions before the cutoff position. Counting
+    actual residues — rather than using the residue number directly as an index
+    — is essential because Chothia resSeq values are not guaranteed to be
+    contiguous (e.g. a chain might jump from 52 to 54, with no residue 53).
+
+    Returns the count of residues up to and including the limit position.
+    """
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("antibody", chothia_path)
 
@@ -53,7 +125,7 @@ def get_chothia_cutoff(chothia_path, chain_id, limit):
             for residue in chain:
                 het, num, ins = residue.id
                 if het != " ":
-                    continue
+                    continue  # skip HETATM residues (ligands, waters)
 
                 m = re.match(r"(\d+)([A-Za-z]*)", str(num))
                 if not m:
@@ -67,7 +139,7 @@ def get_chothia_cutoff(chothia_path, chain_id, limit):
                     count += 1
                     return count
                 else:
-                    return count
+                    return count  # past the cutoff — stop counting
     return count
 
 
@@ -78,6 +150,10 @@ def resolve_fallback_chain_ids(chothia_path, letter):
     """
     If REMARK says H=A L=A, check uppercase and lowercase (A/a),
     extract sequences, classify VH/VL by cysteine spacing.
+
+    This edge case occurs in some SAbDab structures where BioPython preserves
+    case-sensitive chain IDs (e.g. 'A' for heavy, 'a' for light) that are
+    collapsed to the same letter in the REMARK annotation.
     """
 
     parser = PDBParser(QUIET=True)
@@ -115,6 +191,10 @@ def resolve_fallback_chain_ids(chothia_path, letter):
 # MAIN EXTRACTION
 # ---------------------------------------------------------------
 def extract_Fv_from_chothia(chothia_dir, output_dir):
+    """
+    Main extraction loop: processes all *.pdb files in chothia_dir
+    and writes a single paired FASTA to output_dir/single_fv_pdb.fasta.
+    """
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -131,6 +211,8 @@ def extract_Fv_from_chothia(chothia_dir, output_dir):
             pdb_id = os.path.basename(chothia_path).replace("_chothia.pdb", "").lower()
 
             # --- Step 1: read H/L from REMARK ---
+            # SAbDab encodes H/L chain assignments in a REMARK 950 PAIRED_HL line;
+            # this is more reliable than guessing by chain letter conventions
             h_chain = None
             l_chain = None
 
@@ -169,10 +251,15 @@ def extract_Fv_from_chothia(chothia_dir, output_dir):
                 print(f"⚠ Missing VH/VL for {pdb_id}, skipping.")
                 continue
 
-            # --- Step 3: trim ---
+            # --- Step 3: trim to variable domain boundary ---
+            # get_chothia_cutoff returns the number of residues up to and
+            # including the Chothia limit position; slicing to that count
+            # removes the constant domain tail while respecting Chothia gaps
             vh_trim = vh_seq[:get_chothia_cutoff(chothia_path, h_chain, 113)]
             vl_trim = vl_seq[:get_chothia_cutoff(chothia_path, l_chain, 107)]
 
+            # Sequences shorter than 90 residues are almost certainly incomplete
+            # or misidentified chains
             if len(vh_trim) < 90 or len(vl_trim) < 90:
                 print(f"⚠ {pdb_id} trimmed sequences too short. Skipping.")
                 continue
@@ -195,5 +282,3 @@ if __name__ == "__main__":
     output_dir  = "/home/alanwu/Documents/iggen_model/data"
 
     extract_Fv_from_chothia(chothia_dir, output_dir)
-
-

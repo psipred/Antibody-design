@@ -1,3 +1,48 @@
+"""
+Sequence-level evaluation of generated CDR H3 loops vs SAbDab training set
+============================================================================
+Compares H3 loop sequences produced by the fine-tuned antibody model against
+H3 loops extracted from the SAbDab structural training set.  Only high-quality
+SAbDab structures are included: antibodies are kept only if their H3 loop has a
+backbone RMSD ≤ SABDAB_H3_RMSD_MAX Å relative to the experimental structure
+(verified by ColabFold prediction quality).
+
+Analyses performed
+------------------
+1. H3 loop length distribution — histogram comparing training vs generated.
+2. Amino-acid composition — per-AA frequency bar chart.
+3. Nearest-neighbour sequence identity — for each generated H3, find the
+   closest SAbDab H3 by global pairwise alignment identity.
+
+Identity is defined as:
+    matches / max(len(query), len(target))
+where *matches* counts aligned, non-gap, identical residue pairs.
+Using max(len) rather than alignment length penalises indels and avoids
+inflating identity scores for partial overlaps.
+
+Search is accelerated by a length-bucketing heuristic: only SAbDab H3s within
+±LEN_WINDOW residues of the query length are considered as alignment targets.
+This is safe because global alignment identity drops sharply when lengths
+differ significantly.
+
+Inputs
+------
+  SABDAB_TRAIN_FASTA      : FASTA of full Fv sequences from SAbDab (VH:VL format)
+  SABDAB_TRAIN_LOOP_CSV   : CSV with antibody_id, fasta_header_id, VH_len,
+                            H3_start, H3_end columns
+  SABDAB_RMSD_XLSX        : Excel table with antibody_id and H3 RMSD columns
+  GEN_H3_FASTA            : FASTA of H3 sequences extracted by ANARCI from
+                            model-generated antibodies
+
+Outputs (written to OUT_DIR)
+-----------------------------
+  length_hist.png                        — H3 length distribution
+  aa_freq.png                            — amino-acid composition bar chart
+  best_identity_hist.png                 — histogram of nearest-neighbour identities
+  generated_best_match_sabdab_only.csv   — per-generated-H3 best-match details
+
+"""
+
 import os
 import re
 from collections import Counter, defaultdict
@@ -7,6 +52,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from Bio import SeqIO
+
+plt.rcParams.update({'font.size': 14})
 from Bio.Align import PairwiseAligner
 
 
@@ -32,19 +79,26 @@ os.makedirs(OUT_DIR, exist_ok=True)
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
 AA_SET = set(AA_ORDER)
 
-# Speed: only compare to dataset H3s with similar length
+# Only compare against SAbDab H3s within this length window of the query.
+# Speeds up nearest-neighbour search; rarely misses the true best match since
+# global alignment identity drops sharply for large length differences.
 LEN_WINDOW = 10
 
-# Filters
+# Structural quality filter: only include SAbDab antibodies whose H3 loop
+# was modelled with RMSD ≤ this threshold (in Å).  Keeps the reference set
+# to well-predicted, high-confidence loops.
 SABDAB_H3_RMSD_MAX = 1  # include SAbDab H3 only if RMSD <= 1.5
 
 # Alignment parameters (GLOBAL alignment)
 ALIGN_MATCH = 2
 ALIGN_MISMATCH = -1
+# Heavy gap-open penalty discourages introducing gaps, consistent with the
+# expectation that true H3 sequences don't frequently have internal deletions.
 ALIGN_OPEN_GAP = -10
 ALIGN_EXTEND_GAP = -0.5
 
-# Floating tie tolerance when comparing identities
+# Floating-point tolerance when comparing identity scores; avoids incorrect
+# tie-breaking due to rounding errors in alignment score accumulation.
 EPS = 1e-12
 
 
@@ -88,6 +142,7 @@ def infer_loop_csv_cols(df: pd.DataFrame) -> Dict[str, str]:
     cols = {c.lower(): c for c in df.columns}
 
     def need(label: str, patterns: List[str]) -> str:
+        # First try exact match, then regex search — handles minor naming variants
         for pat in patterns:
             for lc, orig in cols.items():
                 if lc == pat:
@@ -129,7 +184,7 @@ def load_keep_ids_from_h3_rmsd(xlsx_path: str, threshold: float = 1.5) -> set:
     """
     df = pd.read_excel(xlsx_path)
 
-    # pick id column
+    # Heuristic column selection: check several common id-column names
     id_col = None
     for c in df.columns:
         if str(c).lower() in ("antibody_id", "pdb", "pdb_id", "id", "name", "fasta_header_id"):
@@ -138,7 +193,8 @@ def load_keep_ids_from_h3_rmsd(xlsx_path: str, threshold: float = 1.5) -> set:
     if id_col is None:
         id_col = df.columns[0]
 
-    # pick rmsd column containing rmsd + (h3 or cdrh3)
+    # Select the shortest column name that matches "rmsd + (h3 or cdrh3)" to
+    # prefer a specific H3 RMSD column over composite metric names.
     rmsd_candidates = []
     for c in df.columns:
         lc = str(c).lower()
@@ -183,6 +239,9 @@ def extract_sabdab_h3s_filtered(
 
         fasta_id = str(row[cols["fasta_header_id"]])
 
+        # Try multiple key matching strategies: exact fasta_id, exact ab id, and
+        # partial substring matches to handle prefix mismatches between the loop CSV
+        # and FASTA headers (e.g. "1abc_H" vs "1abc").
         key = None
         if fasta_id in train_fa:
             key = fasta_id
@@ -201,6 +260,8 @@ def extract_sabdab_h3s_filtered(
             vh_len = int(row[cols["vh_len"]])
         except Exception:
             vh_len = 0
+        # Trim VH to the annotated length to avoid including the VL portion
+        # if the FASTA record contains the concatenated Fv without a ':' separator.
         if vh_len > 0 and vh_len <= len(vh):
             vh = vh[:vh_len]
 
@@ -210,7 +271,8 @@ def extract_sabdab_h3s_filtered(
         except Exception:
             continue
 
-        # detect 0-based vs 1-based by plausibility
+        # Automatically detect whether the CSV uses 0-based or 1-based indexing
+        # by checking which interpretation yields a plausible H3 slice.
         h3_0 = slice_inclusive(vh, s, e, one_based=False)
         h3_1 = slice_inclusive(vh, s, e, one_based=True)
 
@@ -221,6 +283,8 @@ def extract_sabdab_h3s_filtered(
         elif h3_0 is None and h3_1 is not None:
             one_based = True
         else:
+            # Both slices valid; choose 1-based if it produces a CDR-plausible
+            # length (5–35 aa), which is the biologically expected range for H3.
             if 5 <= len(h3_1) <= 35 and not (5 <= len(h3_0) <= 35):
                 one_based = True
             else:
@@ -268,19 +332,18 @@ def plot_length_hist(train_lens: List[int], gen_lens: List[int], out_path: str) 
         train_mean + 0.2,
         ytop * 0.9,
         f"{train_mean:.3g}",
-        fontsize=10
+        fontsize=14
     )
 
     plt.text(
         gen_mean + 0.2,
         ytop * 0.8,
         f"{gen_mean:.3g}",
-        fontsize=10
+        fontsize=14
     )
 
     plt.xlabel("H3 length (aa)")
     plt.ylabel("Count")
-    plt.title("CDR-H3 length distribution")
     plt.legend()
 
     plt.tight_layout()
@@ -295,7 +358,6 @@ def plot_aa_freq(train_freq: np.ndarray, gen_freq: np.ndarray, out_path: str, tr
     plt.xticks(x, AA_ORDER)
     plt.xlabel("Amino acid")
     plt.ylabel("Frequency")
-    plt.title("Pooled AA composition (CDR-H3)")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
@@ -324,7 +386,6 @@ def plot_identity_hist(best_identities: List[float], out_path: str) -> None:
 
     plt.xlabel("identity")
     plt.ylabel("count")
-    plt.title("Nearest neighbour distribution of H3 sequence vs training set (Finetuned)", fontsize=8)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
@@ -345,6 +406,12 @@ def build_aligner() -> PairwiseAligner:
 
 
 def _gapped_strings_from_blocks(a: str, b: str, aligned_blocks) -> Tuple[str, str]:
+    """
+    Reconstructs the gapped alignment strings from Biopython's aligned block
+    representation, which gives contiguous matched segment coordinates rather
+    than an explicit character-by-character alignment string.  This is needed
+    because Biopython ≥1.80 no longer exposes alignment strings directly.
+    """
     a_blocks, b_blocks = aligned_blocks
     i = 0
     j = 0
@@ -394,6 +461,8 @@ def alignment_global_identity(aligner: PairwiseAligner, a: str, b: str) -> Tuple
         if ca == cb:
             matches += 1
 
+    # Denominator is max length, not alignment length; this penalises
+    # length mismatches and avoids inflating identity for short matches.
     denom = max(len(a), len(b))
     ident = matches / denom if denom > 0 else 0.0
     return ident, score
@@ -449,7 +518,8 @@ def main():
     print("[6/7] Nearest-neighbour search (generated -> SAbDab only, choose neighbour by IDENTITY)...")
     aligner = build_aligner()
 
-    # Bucket SAbDab H3s by length for speed
+    # Bucket SAbDab H3s by exact length for O(1) candidate lookup;
+    # only sequences within ±LEN_WINDOW are aligned, avoiding O(N²) comparisons.
     bucket = defaultdict(list)  # length -> list[(antibody_id, h3)]
     for ab, h3 in sabdab_h3_map.items():
         bucket[len(h3)].append((ab, h3))
@@ -463,6 +533,8 @@ def main():
         candidates = []
         for l2 in range(L - LEN_WINDOW, L + LEN_WINDOW + 1):
             candidates.extend(bucket.get(l2, []))
+        # Safety fallback: if no candidates found within the length window
+        # (can happen for very rare H3 lengths), search the full pool.
         if not candidates:
             candidates = list(sabdab_h3_map.items())
 
@@ -473,6 +545,8 @@ def main():
 
         for ab, th3 in candidates:
             ident, score = alignment_global_identity(aligner, gh3, th3)
+            # Primary sort key: identity; secondary: alignment score (breaks ties
+            # from floating-point equality at the EPS tolerance).
             if (ident > best_ident + EPS) or (abs(ident - best_ident) <= EPS and score > best_score):
                 best_ident = ident
                 best_score = score

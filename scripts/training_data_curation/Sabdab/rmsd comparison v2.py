@@ -3,14 +3,71 @@
 Full antibody RMSD + per-loop pLDDT evaluation pipeline
 (upgraded Feb 2025)
 
-Features:
- - Reverse matching (ColabFold → SAbDab)
- - Modern sequence alignment (PairwiseAligner)
- - Per-loop RMSD (H1/H2/H3, L1/L2/L3)
- - Per-loop identity %
- - Per-loop pLDDT
- - Global RMSD + global pLDDT
- - Robust file matching (handles chothia, uppercase, weird prefixes)
+Overview
+--------
+This script compares ColabFold-predicted Fv structures against SAbDab
+crystallographic ground-truth structures. For each antibody in the ColabFold
+output folder, it:
+  1. Loads the predicted structure (rank_001 PDB) and the corresponding
+     SAbDab reference PDB.
+  2. Identifies VH and VL chains in the reference via the PAIRED_HL REMARK.
+  3. Computes heavy-chain RMSD, light-chain RMSD, and global (VH+VL) RMSD
+     by superimposing Cα atoms.
+  4. For each of the six CDR loops (H1/H2/H3, L1/L2/L3), locates the loop
+     in the predicted structure via local sequence alignment, then computes
+     per-loop Cα RMSD, sequence identity, and mean pLDDT.
+  5. Writes all metrics to an Excel file for downstream filtering and analysis.
+
+Design decisions
+----------------
+- Reverse matching (ColabFold → SAbDab):
+    The outer loop iterates over ColabFold output files rather than the SAbDab
+    list. This naturally handles cases where ColabFold predictions are a subset
+    of the reference set, and ensures we only score antibodies for which a
+    prediction exists.
+
+- Per-loop alignment via pairwise2:
+    CDR residues are identified in the predicted structure by local-aligning
+    the predicted chain sequence against the reference CDR sequence (extracted
+    from the PDB by Chothia residue numbers). This handles small insertions or
+    deletions that may cause the predicted sequence to differ slightly from the
+    reference.
+
+- Chothia-based CDR extraction from reference:
+    Reference CDR residues are always extracted from the SAbDab PDB using fixed
+    Chothia residue number ranges. This is authoritative because SAbDab provides
+    Chothia-renumbered structures. No alignment against the reference is needed
+    for the reference side; alignment is only used to locate the loop in the
+    predicted structure.
+
+- Variable domain trimming:
+    Reference VH is trimmed to Chothia ≤ 113 and VL to ≤ 107 before RMSD
+    computation. This removes constant-domain residues that may be present in
+    some SAbDab structures and ensures the comparison is always over the
+    variable domain only.
+
+- pLDDT extraction:
+    The ColabFold rank_001 JSON score file is read to obtain the per-residue
+    pLDDT array. Loop pLDDT values are extracted by slicing the array at the
+    aligned positions, accounting for the VH/VL offset within the concatenated
+    sequence pLDDT array (ColabFold outputs a single array for the entire
+    input sequence).
+
+Inputs
+------
+  SABDAB_DIR     : Directory of SAbDab Chothia-renumbered PDB files.
+  COLABFOLD_DIR  : Directory of ColabFold output PDB + JSON files.
+
+Outputs
+-------
+  OUTPUT_EXCEL : Excel file with one row per antibody and columns:
+                   Antibody_ID, Status,
+                   Heavy_RMSD, Light_RMSD, Global_RMSD,
+                   H1_RMSD, H2_RMSD, H3_RMSD, L1_RMSD, L2_RMSD, L3_RMSD,
+                   H1_Identity(%), ... L3_Identity(%),
+                   H1_pLDDT, ... L3_pLDDT,
+                   Heavy_pLDDT, Global_pLDDT
+
 """
 
 import os, re, math, json
@@ -28,7 +85,8 @@ SABDAB_DIR = "/home/alanwu/Documents/iggen_model/data/post_alphafold_cutoff/post
 COLABFOLD_DIR = "/home/alanwu/Documents/colabfold pipeline/colabfold outputs folder/post_cutoff"
 OUTPUT_EXCEL = "/home/alanwu/Documents/iggen_model/data/post_alphafold_cutoff/post_cutoff_rmsd_comparison.xlsx"
 
-# Correct Chothia CDR definitions
+# Chothia CDR residue number ranges (inclusive) for heavy and light chains.
+# These are fixed constants of the Chothia numbering scheme.
 cdr_ranges = {
     "H": [(26, 32), (52, 56), (95, 102)],
     "L": [(24, 34), (50, 56), (89, 97)],
@@ -40,6 +98,9 @@ def classify_vh_vs_vl(seq):
     Classifies VH vs VL based on conserved cysteine spacing.
     VL: Cys at ~23 and ~88 (distance ~65)
     VH: Cys at ~22 and ~92-104 (distance ~70–85)
+
+    Used as a fallback when the REMARK PAIRED_HL annotation assigns the same
+    chain letter to both VH and VL (case-sensitive chain ID edge case).
     """
 
     cys_positions = [i for i, aa in enumerate(seq) if aa == "C"]
@@ -61,6 +122,10 @@ def resolve_hl_fallback_by_cysteines(pdb_path, fallback_letter):
     For cases where HCHAIN == LCHAIN in REMARK.
     Search for both uppercase and lowercase chain IDs (A, a),
     extract sequences, and classify VH/VL by cysteine spacing.
+
+    This edge case occurs in some SAbDab structures where BioPython preserves
+    case-sensitive chain IDs (e.g. 'A' for heavy, 'a' for light) but the
+    REMARK record uses only the uppercase letter for both.
     """
 
     parser = PDBParser(QUIET=True)
@@ -97,6 +162,14 @@ def align_cdr(seq_model, ref_seq):
     """
     Local alignment via pairwise2. Returns (start_idx, end_idx, identity_pct)
     where start/end refer to positions in seq_model.
+
+    Local alignment (localms) is used rather than global alignment because the
+    model sequence may contain flanking framework residues on either side of the
+    CDR, and the CDR loop length may differ slightly from the reference.
+
+    Scoring: match=+1, mismatch=-1, gap_open=-2, gap_extend=-0.5.
+    Identity is computed as (alignment_score / ref_seq_length) * 100, which
+    penalises mismatches relative to the reference loop length.
     """
 
     # gap open = -2, gap extend = -0.5, match = 1, mismatch = -1
@@ -109,7 +182,9 @@ def align_cdr(seq_model, ref_seq):
     best = alns[0]
     aln_model, aln_ref, score, begin, end = best
 
-    # reconstruct mapping: index in seq_model → index in aligned model
+    # Reconstruct the mapping from aligned positions back to model sequence indices.
+    # We track both model_pos and ref_pos but only record positions where both
+    # sequences are non-gap (i.e. actual aligned residue pairs).
     model_pos = -1
     ref_pos   = -1
 
@@ -142,6 +217,7 @@ def align_cdr(seq_model, ref_seq):
 # ================================
 
 def three_to_one(resname):
+    """Convert 3-letter residue name to 1-letter code; return 'X' for unknown."""
     resname = resname.capitalize().strip()
     return protein_letters_3to1.get(resname, "X")
 
@@ -150,6 +226,9 @@ def parse_first_hl_pair(pdb_path):
     Retrieve H/L chain ID from SAbDab REMARK.
     If both assigned to same letter (e.g., H=A, L=A),
     attempt fallback HL resolution using cysteine spacing.
+
+    Falls back to 'H'/'L' as default chain IDs if no PAIRED_HL REMARK is found,
+    matching the older SAbDab convention before the REMARK was introduced.
     """
 
     h_chain, l_chain = None, None
@@ -181,6 +260,11 @@ def parse_first_hl_pair(pdb_path):
 
 
 def get_ca_atoms(structure, chain_id=None, residue_range=None):
+    """
+    Collect Cα atoms from a structure, optionally filtered by chain ID
+    and/or a set of residue sequence numbers.
+    Only ATOM records (het==' ') are included; HETATM residues are skipped.
+    """
     model = next(structure.get_models())
     atoms = []
     for chain in model:
@@ -196,6 +280,10 @@ def get_ca_atoms(structure, chain_id=None, residue_range=None):
 
 
 def trim_ca_to_variable_domain(structure, chain_id, limit):
+    """
+    Collect Cα atoms from the variable domain only (Chothia resSeq 1 to limit).
+    limit=113 for VH, 107 for VL (matching the trim applied in the FASTA extraction).
+    """
     model = next(structure.get_models())
     atoms = []
     for chain in model:
@@ -209,6 +297,11 @@ def trim_ca_to_variable_domain(structure, chain_id, limit):
 
 
 def calc_rmsd(a, b):
+    """
+    Compute Cα RMSD between two lists of atoms after superimposition.
+    Uses BioPython's Superimposer which applies optimal rotation+translation.
+    Returns None if either list is empty.
+    """
     if not a or not b:
         return None
     n = min(len(a), len(b))
@@ -218,6 +311,11 @@ def calc_rmsd(a, b):
 
 
 def sumsq_from_aligned_pairs(a, b):
+    """
+    Compute sum-of-squared distances between corresponding atom pairs WITHOUT
+    superimposition. Used for combining RMSD contributions across domains when
+    a global superimposition is not appropriate.
+    """
     n = min(len(a), len(b))
     if n == 0: return 0.0, 0
     ss = 0.0
@@ -228,6 +326,10 @@ def sumsq_from_aligned_pairs(a, b):
 
 
 def find_rank1_model(ab_id):
+    """
+    Find the ColabFold rank_001 PDB file for antibody ab_id.
+    ColabFold names output files: {ab_id}*_rank_001_*.pdb
+    """
     for f in os.listdir(COLABFOLD_DIR):
         if f.startswith(ab_id) and "_rank_001_" in f and f.endswith(".pdb"):
             return os.path.join(COLABFOLD_DIR, f)
@@ -235,6 +337,10 @@ def find_rank1_model(ab_id):
 
 
 def find_rank1_json(ab_id):
+    """
+    Find the ColabFold rank_001 score JSON for antibody ab_id.
+    These files contain the per-residue pLDDT array under key 'plddt'.
+    """
     for f in os.listdir(COLABFOLD_DIR):
         if f.startswith(ab_id) and "_scores_rank_001_" in f and f.endswith(".json"):
             return os.path.join(COLABFOLD_DIR, f)
@@ -246,6 +352,11 @@ def find_rank1_json(ab_id):
 # ================================
 
 def get_cdr_ref_atoms_and_seq(ref_struct, chain_id, start, end):
+    """
+    Extract Cα atoms and sequence for residues with Chothia resSeq in [start, end]
+    from the reference structure. Only ATOM records are included.
+    Returns (list_of_CA_atoms, one_letter_sequence_string).
+    """
     model = next(ref_struct.get_models())
     atoms, seq = [], []
     for chain in model:
@@ -267,7 +378,25 @@ def compute_cdr_stats_for_chain(
         ref_struct, ref_chain_id,
         model_chain, seq_model,
         cdr_list, plddt, offset, prefix):
+    """
+    Compute RMSD, sequence identity, and pLDDT for each CDR loop of one chain.
 
+    Parameters
+    ----------
+    ref_struct    : BioPython Structure for the SAbDab reference PDB.
+    ref_chain_id  : Chain ID for the reference chain (e.g. 'H' or 'L').
+    model_chain   : BioPython Chain object for the predicted structure.
+    seq_model     : 1-letter sequence of the predicted chain.
+    cdr_list      : List of (start, end) Chothia residue number ranges for this chain.
+    plddt         : Full pLDDT array for the predicted structure (all chains).
+    offset        : Residue index offset into plddt for this chain (0 for VH,
+                    len(seq_H) for VL, since ColabFold concatenates both chains).
+    prefix        : 'H' or 'L' — used to name output columns (H1_RMSD, etc.).
+
+    Returns
+    -------
+    dict mapping column names to values.
+    """
     results = {}
     ca_list = [res["CA"] for res in model_chain if "CA" in res]
     loop_idx = 1
@@ -286,6 +415,7 @@ def compute_cdr_stats_for_chain(
             loop_idx += 1
             continue
 
+        # Locate the reference CDR loop in the predicted chain by local alignment
         s, e, ident = align_cdr(seq_model, ref_seq)
         if s is None:
             results[key_rmsd] = None
@@ -294,10 +424,13 @@ def compute_cdr_stats_for_chain(
             loop_idx += 1
             continue
 
+        # Slice the predicted chain's Cα list to the aligned region
         mod_atoms = ca_list[s:e]
         rmsd = calc_rmsd(ref_atoms, mod_atoms)
 
         if plddt is not None:
+            # Convert chain-local indices (s, e) to absolute pLDDT array indices
+            # using the chain's starting offset within the full sequence
             abs_s = offset + s
             abs_e = min(offset + e, len(plddt))
             vals = plddt[abs_s:abs_e]
@@ -319,6 +452,12 @@ def compute_cdr_stats_for_chain(
 # ================================
 
 def compare_antibody(ab_id):
+    """
+    Compare one antibody's ColabFold prediction against the SAbDab ground truth.
+
+    Returns a dict with all metrics (or None values if files are missing or
+    processing fails). A 'Status' field indicates 'OK' or 'Missing file'.
+    """
 
     base = {
         "Antibody_ID": ab_id,
@@ -335,7 +474,8 @@ def compare_antibody(ab_id):
         "Global_pLDDT": None,
     }
 
-    # Try several candidate file names
+    # Try several candidate file names to handle variations in SAbDab file naming
+    # (some files have _chothia suffix, some are lowercase, some uppercase)
     candidates = [
         f"{ab_id}.pdb",
         f"{ab_id}_chothia.pdb",
@@ -365,11 +505,12 @@ def compare_antibody(ab_id):
     # Chain IDs
     h_chain, l_chain = parse_first_hl_pair(ref_path)
 
-    # Extract CA atoms
+    # Extract reference Cα atoms trimmed to variable domain
     ref_h = trim_ca_to_variable_domain(ref_struct, h_chain, 113)
     ref_l = trim_ca_to_variable_domain(ref_struct, l_chain, 107)
 
     m0 = next(model_struct.get_models())
+    # ColabFold outputs multimer chains as A (heavy) and B (light)
     chainA = m0["A"]
     chainB = m0["B"]
 
@@ -386,7 +527,7 @@ def compare_antibody(ab_id):
 
     n = min(len(ref_all), len(mod_all))
 
-    # RMSDs
+    # Per-chain and global RMSD (Superimposer finds optimal superposition)
     heavy_rmsd = calc_rmsd(ref_h, mod_h)
     light_rmsd = calc_rmsd(ref_l, mod_l)
 
@@ -397,12 +538,12 @@ def compare_antibody(ab_id):
     global_rmsd=calc_rmsd(ref_all, mod_all)
 
 
-    # Model sequences
+    # Model sequences (needed for CDR alignment)
     ppb = PPBuilder()
     seq_H = "".join(str(pp.get_sequence()) for pp in ppb.build_peptides(chainA))
     seq_L = "".join(str(pp.get_sequence()) for pp in ppb.build_peptides(chainB))
 
-    # pLDDT
+    # Load pLDDT from the ColabFold score JSON
     plddt = None
     jpath = find_rank1_json(ab_id)
     if jpath and os.path.exists(jpath):
@@ -413,6 +554,10 @@ def compare_antibody(ab_id):
 
     global_plddt = float(np.mean(plddt)) if plddt is not None else None
 
+    # Offsets for slicing the pLDDT array per chain.
+    # ColabFold concatenates VH and VL into a single sequence, so the pLDDT
+    # array has shape (len(VH) + len(VL),). VH residues start at 0; VL residues
+    # start at len(seq_H).
     offset_H = 0
     offset_L = len(seq_H) if plddt is not None else 0
 
@@ -454,7 +599,9 @@ def compare_antibody(ab_id):
 def main():
     results = []
 
-    # Look for rank_001 models
+    # Iterate over ColabFold rank_001 PDB files to drive the comparison.
+    # This "reverse" direction (predictions → reference) means we only process
+    # antibodies for which a prediction actually exists.
     pdbs = sorted([
         f for f in os.listdir(COLABFOLD_DIR)
         if f.endswith(".pdb") and "_rank_001_" in f

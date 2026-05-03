@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-# Shell snippet (not Python). Run: bash colab-fold-command.py   or: chmod +x && ./colab-fold-command.py
+# =============================================================================
+# ColabFold batch prediction command — single FASTA file.
+#
+# Despite the .py extension this is a Bash shell script (not Python).
+#
+# What this does
+# --------------
+# Runs `colabfold_batch` to predict the 3-D structure of a single paired
+# antibody Fv sequence (FASTA file 4813.fasta) using AlphaFold2-Multimer v2.
+#
+# Input / Output
+# --------------
+# Input : .../incremental/4813.fasta       — paired Fv FASTA for antibody 4813
+# Output: .../colabfold outputs folder/incremental/4813/  — PDB + JSON files
+# =============================================================================
 set -euo pipefail
 
 colabfold_batch \

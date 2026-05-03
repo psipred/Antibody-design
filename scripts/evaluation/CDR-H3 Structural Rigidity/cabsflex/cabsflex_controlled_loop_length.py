@@ -1,4 +1,39 @@
 #!/usr/bin/env python3
+"""
+CDR H3 RMSF vs Loop Length — controlled comparison
+====================================================
+Investigates whether differences in mean CDR H3 RMSF between baseline and
+fine-tuned model outputs are confounded by H3 loop length.  CABSflex RMSF
+generally scales with loop length (longer loops have more degrees of freedom),
+so a naïve group comparison could reflect length distributions rather than
+true flexibility differences.
+
+This script produces a length-stratified bubble chart where:
+  * x-axis  = H3 loop length (number of residues in Chothia 95–102)
+  * y-axis  = mean H3 RMSF averaged over all antibodies at that length
+  * bubble size ∝ sample count  (larger bubbles = more antibodies at that length)
+  * error bars = standard error of the mean at each length bin
+
+Only length bins with at least MIN_COUNT_PER_LEN antibodies are plotted; sparse
+bins would give unreliable means and inflate visual differences.
+
+Inputs
+------
+  BASELINE_DIR / FINETUNED_DIR : CABSflex output trees (one subdir per antibody)
+  BASELINE_ANARCI / FINETUNED_ANARCI : ANARCI Chothia-numbered output files
+
+Outputs (written to OUTPUT_DIR)
+--------------------------------
+  mean_h3_rmsf_vs_loop_length_baseline_vs_finetuned.png
+      Bubble chart with error bars.
+  per_entry_h3_length_rmsf.tsv
+      Flat table: (entry, group, h3_seq, h3_len, h3_mean_rmsf) per antibody.
+  binned_mean_h3_rmsf.tsv
+      Summary table: (group, h3_len, n, mean, sd, se) per length bin.
+  run_log.txt
+      All log() output for reproducibility.
+
+"""
 
 import os
 import re
@@ -9,6 +44,8 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+plt.rcParams.update({'font.size': 14})
 
 
 # =========================================================
@@ -32,6 +69,8 @@ RAW_TABLE_PATH = os.path.join(OUTPUT_DIR, "per_entry_h3_length_rmsf.tsv")
 BIN_SUMMARY_PATH = os.path.join(OUTPUT_DIR, "binned_mean_h3_rmsf.tsv")
 LOG_PATH = os.path.join(OUTPUT_DIR, "run_log.txt")
 
+# Minimum antibodies per length to include a bin in the plot;
+# bins with fewer samples give unreliable mean estimates.
 MIN_COUNT_PER_LEN = 3
 
 
@@ -93,6 +132,7 @@ def find_rmsf_file(job_dir):
     if os.path.exists(path):
         return path
 
+    # Fallback for non-standard CABSflex output layouts
     candidates = (
         glob.glob(os.path.join(job_dir, "**", "RMSF.csv"), recursive=True) +
         glob.glob(os.path.join(job_dir, "**", "rmsf.csv"), recursive=True)
@@ -121,6 +161,8 @@ def parse_anarci(filepath):
         for line in f:
             line = line.strip()
 
+            # Distinguish antibody ID header lines from ANARCI metadata lines;
+            # the negative-list blocks known metadata patterns shared by both.
             if line.startswith("# ") and not any(x in line for x in
                     ["ANARCI", "Domain", "Most", "species", "Scheme", "e-value",
                      "numbered", "significant", "HMM", "|"]):
@@ -134,6 +176,7 @@ def parse_anarci(filepath):
             if line.startswith("#") or line == "":
                 continue
 
+            # "//" marks end-of-record
             if line == "//":
                 if current_ab is not None:
                     ab_data[current_ab] = current_residues
@@ -151,6 +194,8 @@ def parse_anarci(filepath):
                 if num_match:
                     chothia_num = int(num_match.group(1))
                     if aa != "-":
+                        # Gap positions don't correspond to a physical residue
+                        # and have no RMSF entry, so skip seq_index increment.
                         seq_index += 1
                         current_residues.append((chothia_num, num_str, aa, seq_index))
 
@@ -286,6 +331,7 @@ def summarise_by_loop_length(rows):
             vals = [r["h3_mean_rmsf"] for r in group_rows if r["h3_len"] == L]
             n = len(vals)
 
+            # Skip sparse bins to avoid misleading data points
             if n < MIN_COUNT_PER_LEN:
                 continue
 
@@ -293,6 +339,9 @@ def summarise_by_loop_length(rows):
 
             mean_val = float(np.mean(vals))
             sd_val = float(np.std(vals))
+            # SE (standard error of the mean) is the relevant quantity for
+            # error bars because we care about precision of the mean, not
+            # the spread of individual observations (which SD would show).
             se_val = float(np.std(vals, ddof=1) / math.sqrt(n)) if n > 1 else 0.0
 
             summaries.append({
@@ -336,6 +385,8 @@ def plot_bubble_length_rmsf(summaries, out_path):
         n = np.array([d["n"] for d in grp], dtype=float)
         se = np.array([d["se_h3_rmsf"] for d in grp], dtype=float)
 
+        # Bubble area encodes sample count: base size 40 prevents dots from
+        # disappearing at n=1, and the 25*n term scales linearly with count.
         sizes = 40 + 25 * n
         color = color_map[group]
 
@@ -348,20 +399,13 @@ def plot_bubble_length_rmsf(summaries, out_path):
     if not plotted_any:
         raise ValueError("No loop-length groups had enough points to plot.")
 
-    example_ns = [3, 10, 20]
-    example_sizes = [40 + 25 * k for k in example_ns]
-    handles = [
-        plt.scatter([], [], s=s, alpha=0.55, color="gray", label=f"n={k}")
-        for s, k in zip(example_sizes, example_ns)
-    ]
-
-    leg1 = plt.legend(loc="best")
-    plt.gca().add_artist(leg1)
-
     plt.xlabel("H3 loop length")
     plt.ylabel("Mean H3 RMSF (Å)")
-    plt.title("Mean H3 RMSF at matched H3 loop length")
-    plt.xlim(left=0)
+    if summaries:
+        all_lens = [d["h3_len"] for d in summaries]
+        # Small proportional padding so the outermost bubbles aren't clipped
+        pad = (max(all_lens) - min(all_lens)) * 0.04 + 0.5
+        plt.xlim(min(all_lens) - pad, max(all_lens) + pad)
     plt.ylim(bottom=0)
     plt.grid(alpha=0.3)
     plt.tight_layout()

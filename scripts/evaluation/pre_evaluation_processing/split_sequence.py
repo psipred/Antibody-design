@@ -1,3 +1,54 @@
+"""
+split_sequence.py — VH/VL Chain Splitter for p-IgGen Raw Output
+================================================================
+
+PURPOSE
+-------
+p-IgGen (and similar antibody language models) paired sequence generation mode did not work locally. This
+script recovers the boundary and produces structured output for downstream
+tools (AlphaFold/ColabFold structural prediction, ANARCI numbering, etc.).
+
+INPUT
+-----
+  model_output/raw_sequences.txt
+    Plain text file; one concatenated VH+VL sequence per line, no header.
+
+OUTPUTS
+-------
+  pairs_split.txt   — One "VH, VL" pair per line (human-readable).
+  failed_lines.txt  — Lines for which no reliable split point was found.
+  fasta/incremental/4813.fasta
+    Paired FASTA in ColabFold multimer format: each entry has a single
+    sequence line "VH:VL". ColabFold interprets ":" as a chain break,
+    letting it fold VH and VL as a heterodimer without a linker.
+
+SPLITTING STRATEGY (two-tier)
+------------------------------
+1. VL-start motif detection (preferred):
+     Scan for known light-chain N-terminal consensus sequences (e.g.
+     "DIQMTQ" for kappa chains, "QSVLTQ" for lambda chains). Search only
+     past position 80 to avoid spurious matches within VH. VL starts are
+     more conserved than VH ends and are therefore more reliable anchors.
+
+2. Heavy-end motif detection (fallback):
+     If no VL start is found, scan for conserved J-gene framework 4
+     sequences at the VH C-terminus (e.g. "WGQGTLVTVSS"). Split
+     immediately after the last (rightmost) occurrence to handle any
+     repeated sub-strings appearing earlier in the sequence.
+
+Both strategies enforce minimum length guards (VH ≥ 90 aa, VL ≥ 80 aa) to
+reject implausible splits caused by partial motif matches.
+
+HOW TO RUN
+----------
+  python split_sequence.py
+  (No command-line arguments; edit the path constants below to change paths.)
+
+DEPENDENCIES
+------------
+  Python ≥ 3.8 standard library only (pathlib).
+"""
+
 # split_and_convert_piggen_raw_to_fasta.py
 #
 # 1) Reads p-IgGen "raw" output where each line is a single concatenated Fv (VH+VL, no delimiter)
@@ -20,15 +71,17 @@ PAIRS_FASTA = Path("/home/alanwu/Documents/iggen_model/model_output/fasta/increm
 
 # Light-chain starts are more consistent than heavy-chain ends
 VL_START_MOTIFS = [
-    "DIQMTQ", "DIVMTQ", "DVVMTQ",
-    "EIVLTQ", "EIVMTQ",
-    "QSVLTQ", "QSALTQ", "QITLK", "QVTLR",
+    "DIQMTQ", "DIVMTQ", "DVVMTQ",   # kappa VL (IGKV) group 1/2
+    "EIVLTQ", "EIVMTQ",               # kappa VL group 3
+    "QSVLTQ", "QSALTQ", "QITLK", "QVTLR",  # lambda VL starters
     "ENVLTQ", "SYELTQ", "SSELTQ", "AIQLTQ",
-    "MTQSP", "VLTQSP", "LTQSP",
+    "MTQSP", "VLTQSP", "LTQSP",       # partial-motif fallbacks for truncated starts
 ]
 
 # Fallback heavy-end motifs (broad)
 HEAVY_END_MOTIFS = [
+    # These are the J-gene framework 4 (FR4) consensus sequences at the VH C-terminus.
+    # Multiple variants exist due to IGHJ gene diversity and somatic mutation.
     "WGQGTLVTVSS", "WGQGTTVTVSS", "WGQGSLVTVSS", "WGQGILVTVSS", "WGQGTSVTVSS",
     "WGRGTLVTVSS", "WGHGTTVTVSS", "WGKGTTVTVSS", "WGHGTLVTVSS",
     "WGQGTLVTVSA", "WGQGTTVTVSA", "WGRGTLVTVSA", "WGKGTTVTVSA",
@@ -42,6 +95,8 @@ def split_by_vl_start(s: str):
     """
     Find earliest plausible VL start AFTER a safe offset to avoid matching inside VH.
     """
+    # VH sequences are always >80 aa, so any motif hit before position 80 is
+    # a false positive inside the heavy chain — skip it.
     safe_offset = 80
     candidates = []
     for motif in VL_START_MOTIFS:
@@ -52,6 +107,8 @@ def split_by_vl_start(s: str):
     if not candidates:
         return None
 
+    # Take the earliest hit to maximise VH length; later hits would shorten VH
+    # and lengthen VL, both of which push toward implausible lengths.
     cut = min(candidates)
     vh, vl = s[:cut], s[cut:]
 
@@ -66,7 +123,7 @@ def split_by_heavy_end(s: str):
     """
     best_cut = None
     for motif in HEAVY_END_MOTIFS:
-        idx = s.rfind(motif)
+        idx = s.rfind(motif)  # rfind avoids false positives from VH internal repeats
         if idx != -1:
             cut = idx + len(motif)
             if best_cut is None or cut > best_cut:
@@ -87,10 +144,13 @@ def split_vh_vl(line: str):
     if not s:
         return None
 
+    # Try VL-start detection first — it is the more reliable of the two strategies.
     res = split_by_vl_start(s)
     if res is not None:
         return res
 
+    # If no VL-start motif is found (e.g. novel or mutated N-termini), fall back
+    # to locating the conserved VH C-terminal J-gene sequence.
     res = split_by_heavy_end(s)
     if res is not None:
         return res
@@ -121,8 +181,12 @@ def write_pairs_fasta(pairs):
             vl = vl.strip().replace(" ", "")
             if not vh or not vl:
                 continue
+            # Reject sequences with non-alphabetic characters (e.g. gaps, digits
+            # from incomplete splitting or model artefacts).
             if not vh.isalpha() or not vl.isalpha():
                 continue
+            # ColabFold/AlphaFold-Multimer reads ":" as a chain break; no linker
+            # is needed in this format.
             f.write(f">ab_{i}\n{vh}:{vl}\n")
             n_written += 1
 

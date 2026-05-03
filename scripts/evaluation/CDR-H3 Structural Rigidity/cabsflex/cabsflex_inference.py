@@ -1,15 +1,39 @@
 #!/usr/bin/env python2
 """
-Batch CABS-flex runner for ColabFold multimer outputs
-======================================================
-Searches INPUT_DIR for subdirectories, picks the rank_001 PDB from each,
-and runs CABSflex in parallel.
+Batch CABSflex runner for ColabFold multimer outputs
+=====================================================
+Discovers rank_001 PDB files produced by ColabFold (best-confidence model per
+antibody), then submits them as CABSflex flexibility simulations in parallel.
+Results land in OUTPUT_DIR/<job_id>/ with a per-run log and a batch summary TSV.
 
-Usage
------
-    python run_cabsflex_batch.py [--workers N] [--dry-run]
+CABSflex simulation strategy
+-----------------------------
+* Temperature 1.4–1.4 (Lennard-Jones units): near-native range that preserves
+  the overall fold while allowing loop breathing.
+* `-g all 3 3.8 8.0`: applies distance restraints to ALL secondary-structure
+  elements (helices and sheets) but leaves loops — including CDR H3 — completely
+  free to move.  This ensures that the RMSF signal we measure for H3 reflects
+  genuine loop flexibility, not rigid-body rotation of the whole framework.
+* `--weighted-fit gauss`: superimposes each sampled conformation onto the
+  reference by weighting on secondary-structure elements (Gaussian weighting).
+  This removes global tumbling from the RMSF, so high values specifically mark
+  regions that move *relative to the framework* (i.e. the CDR loops).
+* REPLICAS=1: a single replica is sufficient for computing relative RMSF values
+  across many antibodies; multiple replicas would be needed for absolute
+  thermodynamic observables.
 
-Paths are hardcoded below - edit INPUT_DIR, OUTPUT_DIR, WORKERS if needed.
+Inputs
+------
+  INPUT_DIR  : directory of ColabFold output folders (one per antibody),
+               each containing at least one *_unrelaxed_rank_001_*.pdb.
+               Also handles a flat layout where all PDBs sit directly in
+               INPUT_DIR without subdirectories.
+
+Outputs
+-------
+  OUTPUT_DIR/<job_id>/  : CABSflex work directories (trajectory, RMSF.csv, etc.)
+  OUTPUT_DIR/batch_summary.tsv : per-job success/failure and wall-clock time
+
 """
 
 from __future__ import print_function
@@ -109,15 +133,21 @@ def run_job(args):
         "-y", str(MC_CYCLES),  # MC cycles
         "-s", str(MC_STEPS),   # MC steps between frames
         "-r", str(REPLICAS),   # replicas for better loop sampling
-        "-t", "1.4", "1.4",    # near-native temperature
-        "-g", "all", "3", "3.8", "8.0",  # restrain SS elements only, loops (CDR H3) free
+        "-t", "1.4", "1.4",    # near-native temperature (start, end in CABS LJ units)
+        # Restrain secondary-structure elements; gap parameters (3, 3.8, 8.0)
+        # are SS detection thresholds — loops including CDR H3 remain unrestrained.
+        "-g", "all", "3", "3.8", "8.0",
         "-k", str(NUM_MODELS), # number of clustered output models
-        "--weighted-fit", "gauss", # align on SS elements so CDR H3 RMSF reflects true loop movement
+        # Superimpose on SS elements (Gaussian weighting) so CDR H3 RMSF
+        # captures loop movement relative to the antibody framework.
+        "--weighted-fit", "gauss",
         "-M",                  # generate contact maps
     ]
 
     start = time.time()
     try:
+        # Redirect both stdout and stderr to a per-job log; keeps the terminal
+        # output clean and allows post-hoc debugging of individual failures.
         with open(log_path, "w") as lf:
             subprocess.check_call(cmd, stdout=lf, stderr=subprocess.STDOUT)
         elapsed = time.time() - start
@@ -185,7 +215,8 @@ def main():
 
     log.info("Running {} jobs with {} workers...".format(len(job_args), workers))
 
-    # Run in parallel
+    # imap_unordered streams results as they finish rather than buffering all
+    # completions; this allows progress logging even when jobs have unequal runtimes.
     pool = Pool(processes=workers)
     results = []
     completed = 0

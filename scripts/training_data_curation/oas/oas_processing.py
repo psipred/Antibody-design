@@ -2,14 +2,28 @@
 """
 OAS paired table extractor + FV trimming (includes FR4) + APPEND mode.
 
-This version:
-- Takes MULTIPLE input .csv.gz files
-- Writes outputs under:
-    /home/alanwu/Documents/iggen_model/data/oas data/vh_vl/native_healthy
-    /home/alanwu/Documents/iggen_model/data/oas data/cdr_sequence/native_healthy
-- For each input file, creates one subfolder named after the file stem prefix,
-  e.g. 1279065_1, 1279073_1, 1287155_1
-- Keeps all previous extraction / fallback / dedup logic unchanged
+Overview
+--------
+This script processes raw OAS (Observed Antibody Space) paired antibody
+sequence tables (compressed CSV) and extracts two FASTA outputs per batch:
+  1. paired_fv_trimmed.fasta  — full variable domain (VH:VL), including FR4.
+  2. cdr_loops.fasta          — all six CDR loops (CDRH1/2/3, CDRL1/2/3).
+
+These FASTAs are the primary inputs to the downstream pLDDT computation
+(oas_plddt.py) and clustering (oas_cluster.py) steps.
+
+Inputs
+------
+  INFILES: list of Path objects pointing to OAS paired CSV.gz files.
+           Each filename must match the pattern {study_id}_Paired_All.csv.gz.
+
+Outputs
+-------
+  For each input file, creates one subdirectory named after the study ID stem
+  (e.g. 1279065_1) under both VHVL_ROOT and CDR_ROOT:
+    {VHVL_ROOT}/{study_id}/paired_fv_trimmed.fasta
+    {CDR_ROOT}/{study_id}/cdr_loops.fasta
+
 """
 
 from pathlib import Path
@@ -44,6 +58,7 @@ DEDUP_ID_ONLY = True   # True: dedup by record id; False: dedup by full header l
 
 def infer_batch_name(infile: Path) -> str:
     """
+    Extract the study batch ID from the filename.
     Example:
       1279065_1_Paired_All.csv.gz -> 1279065_1
     """
@@ -55,6 +70,11 @@ def infer_batch_name(infile: Path) -> str:
 
 
 def detect_sep_from_second_line(path: Path) -> str:
+    """
+    OAS files may be tab- or comma-delimited. Auto-detect by counting
+    delimiter occurrences on the header line (second line, since the first
+    line is metadata). Whichever delimiter appears more often wins.
+    """
     with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
         _ = f.readline()      # metadata
         header = f.readline() # header
@@ -65,6 +85,11 @@ def detect_sep_from_second_line(path: Path) -> str:
 
 
 def _norm(s: str) -> str:
+    """
+    Normalize a column name by removing BOM characters, spaces, tabs, and
+    newlines. Used to make column name matching robust to encoding artifacts
+    commonly found in OAS files.
+    """
     return (
         str(s)
         .strip()
@@ -77,6 +102,16 @@ def _norm(s: str) -> str:
 
 
 def pick_col(cols, candidates):
+    """
+    Find the actual column name in 'cols' that matches any of the 'candidates'.
+
+    Two match modes:
+      - Exact (no '*'): normalized column name must equal the normalized candidate.
+      - Suffix ('*suffix'): normalized column name must end with the normalized suffix.
+        This handles OAS files where column names have dataset-specific prefixes.
+
+    Exact matches are preferred over suffix matches.
+    """
     norm_map = {_norm(c): c for c in cols}
 
     for cand in candidates:
@@ -98,6 +133,7 @@ def pick_col(cols, candidates):
 
 
 def clean_seq_letters_only(x):
+    """Strip non-alphabetic characters; uppercase. Returns None for empty/NaN."""
     if pd.isna(x):
         return None
     s = str(x).strip().upper()
@@ -106,6 +142,11 @@ def clean_seq_letters_only(x):
 
 
 def clean_seq_aa(x):
+    """
+    Like clean_seq_letters_only but also removes stop-codon asterisks ('*').
+    OAS amino acid columns can contain '*' for stop codons at the end of
+    truncated sequences; these must be stripped before writing FASTA.
+    """
     s = clean_seq_letters_only(x)
     if not s:
         return None
@@ -113,6 +154,7 @@ def clean_seq_aa(x):
 
 
 def _to_int(x):
+    """Safe int conversion; returns None for NaN or non-numeric values."""
     if pd.isna(x):
         return None
     try:
@@ -122,6 +164,10 @@ def _to_int(x):
 
 
 def trim_1based(seq: str, start_1based: int, end_1based: int):
+    """
+    Trim a sequence using 1-based inclusive coordinates (as stored in OAS).
+    Returns None if coordinates are invalid or out of range.
+    """
     if seq is None or start_1based is None or end_1based is None:
         return None
     if start_1based < 1 or end_1based < 1 or end_1based < start_1based:
@@ -132,6 +178,11 @@ def trim_1based(seq: str, start_1based: int, end_1based: int):
 
 
 def trim_0based(seq: str, start_0based: int, end_0based_inclusive: int):
+    """
+    Trim using 0-based coordinates as a fallback if 1-based trimming fails.
+    Some OAS files store coordinates in 0-based format; trying both avoids
+    losing sequences due to off-by-one uncertainty.
+    """
     if seq is None or start_0based is None or end_0based_inclusive is None:
         return None
     if start_0based < 0 or end_0based_inclusive < 0 or end_0based_inclusive < start_0based:
@@ -144,7 +195,13 @@ def trim_0based(seq: str, start_0based: int, end_0based_inclusive: int):
 def build_fv_from_regions(row, cols_map):
     """
     Build FV AA by concatenating region AA strings INCLUDING FR4.
-    Returns (vh_fv, vl_fv) or (None, None).
+
+    The order is: FWR1 + CDR1 + FWR2 + CDR2 + FWR3 + CDR3 + FWR4 for
+    both heavy and light chains. Including FR4 is important because it
+    contains residues that are part of the variable domain fold (WGxG motif)
+    and are needed as a context signal by the antibody model.
+
+    Returns (vh_fv, vl_fv) or (None, None) if any region is missing.
     """
     (
         h_fwr1, h_cdr1, h_fwr2, h_cdr2, h_fwr3, h_cdr3, h_fwr4,
@@ -154,6 +211,7 @@ def build_fv_from_regions(row, cols_map):
     parts_h = [clean_seq_aa(row.get(c)) for c in [h_fwr1, h_cdr1, h_fwr2, h_cdr2, h_fwr3, h_cdr3, h_fwr4]]
     parts_l = [clean_seq_aa(row.get(c)) for c in [l_fwr1, l_cdr1, l_fwr2, l_cdr2, l_fwr3, l_cdr3, l_fwr4]]
 
+    # Any missing region makes the full Fv unusable
     if any(p is None for p in parts_h) or any(p is None for p in parts_l):
         return None, None
 
@@ -165,6 +223,7 @@ def build_fv_from_regions(row, cols_map):
 def load_existing_ids_vhvl(fasta_path: Path) -> set[str]:
     """
     For >{rid}|VH:VL headers: store rid only if DEDUP_ID_ONLY else full header.
+    Used to avoid re-writing entries that are already present in the output FASTA.
     """
     if not fasta_path.exists():
         return set()
@@ -238,6 +297,8 @@ def process_one_file(infile: Path):
         print(f"[dedup] existing VHVL records: {len(existing_vhvl)}")
         print(f"[dedup] existing loop records: {len(existing_loops)} (dedup key={'rid' if DEDUP_ID_ONLY else 'full header'})")
 
+    # Read only the header row first to detect available columns before
+    # committing to a full chunked read with usecols
     header_df = pd.read_csv(
         infile,
         compression="gzip",
@@ -280,7 +341,7 @@ def process_one_file(infile: Path):
         l_fwr1_aa, l_cdr1_aa, l_fwr2_aa, l_cdr2_aa, l_fwr3_aa, l_cdr3_aa, l_fwr4_aa,
     ])
 
-    # Fallback columns
+    # Fallback columns (used when pre-split region columns are absent)
     col_seq_h = pick_col(cols, ["sequence_heavy", "*sequence_heavy"])
     col_seq_l = pick_col(cols, ["sequence_light", "*sequence_light", "sequence"])
 
@@ -303,6 +364,9 @@ def process_one_file(infile: Path):
     col_l_cdr3_s = pick_col(cols, ["cdr3_start_light", "*cdr3_start_light"])
     col_l_cdr3_e = pick_col(cols, ["cdr3_end_light", "*cdr3_end_light"])
 
+    # Prefer region AA assembly (concatenate pre-annotated FWR/CDR AA segments)
+    # because it is unambiguous.  Fall back to coordinate-based trimming of the
+    # full sequence when region columns are absent (older OAS releases).
     if not have_region_aa:
         needed_fallback = [col_seq_h, col_seq_l, col_h_fwr1_s, col_h_fwr4_e, col_l_fwr1_s, col_l_fwr4_e]
         if any(x is None for x in needed_fallback):
@@ -315,6 +379,7 @@ def process_one_file(infile: Path):
                 "OR sequence + fwr1_start + fwr4_end."
             )
 
+    # Only load the columns we actually need to minimise memory usage
     usecols = {col_id_h}
     if col_id_l is not None:
         usecols.add(col_id_l)
@@ -369,6 +434,8 @@ def process_one_file(infile: Path):
 
                 base_id = str(hid).strip()
                 rid = base_id
+                # Combine heavy and light IDs with '__' when both are present,
+                # matching the format used by canonicalize_id in oas_plddt.py
                 if lid is not None and not pd.isna(lid):
                     lid_s = str(lid).strip()
                     if lid_s and lid_s != rid:
@@ -411,6 +478,7 @@ def process_one_file(infile: Path):
                     l_start = _to_int(row.get(col_l_fwr1_s))
                     l_end = _to_int(row.get(col_l_fwr4_e))
 
+                    # Try 1-based trimming first; fall back to 0-based if that fails
                     vh_try = trim_1based(vh_full, h_start, h_end)
                     vl_try = trim_1based(vl_full, l_start, l_end)
                     if vh_try is None or vl_try is None:
@@ -438,6 +506,8 @@ def process_one_file(infile: Path):
                             out = trim_0based(full_seq, s, e)
                         return out
 
+                    # If AA columns for CDR loops are missing, extract from the
+                    # full sequence using coordinate columns as a fallback
                     if cdrh1 is None:
                         cdrh1 = slice_loop(vh_full, col_h_cdr1_s, col_h_cdr1_e)
                     if cdrh2 is None:
@@ -462,6 +532,8 @@ def process_one_file(infile: Path):
                     n_bad_trim += 1
                     continue
 
+                # VH:VL separated by ':' — this delimiter is used consistently
+                # across the pipeline to split paired sequences back apart
                 f_fv.write(f">{rid}|VH:VL\n{vh_fv}:{vl_fv}\n")
 
                 loops = [
@@ -490,6 +562,8 @@ def process_one_file(infile: Path):
 
                 n_written += 1
 
+                # Update in-memory dedup sets so later chunks in the same file
+                # are also protected against writing duplicates
                 if DEDUP_EXISTING:
                     existing_vhvl.add(dedup_key_vhvl)
                     if DEDUP_ID_ONLY:

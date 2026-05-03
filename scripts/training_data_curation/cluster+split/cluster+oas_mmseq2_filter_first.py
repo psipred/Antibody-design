@@ -1,3 +1,48 @@
+"""
+Filter-then-cluster pipeline for antibody Fv training data.
+
+Overview
+--------
+This script builds the train/val FASTA split used to train the IgGen model.
+It draws sequences from two sources:
+  - SAbDab: crystallographically resolved antibody Fv structures (high-confidence
+    ground-truth structures), filtered by CDRH3 RMSD (ColabFold prediction vs PDB).
+  - OAS: paired heavy/light sequences from the Observed Antibody Space, filtered
+    by CDRH3 mean pLDDT (AlphaFold2/ColabFold confidence score).
+
+Pipeline stages
+---------------
+1. Quality filtering FIRST (before clustering):
+     - SAbDab entries: kept only if H3_RMSD ≤ SABDAB_H3_RMSD_MAX (2.0 Å).
+       RMSD measures how accurately ColabFold can reconstruct the CDR-H3 loop,
+       ensuring we only train on structures whose loop geometry can be predicted.
+     - OAS entries: kept only if CDRH3_mean_pLDDT ≥ OAS_PLDDT_THRESHOLD (80.0).
+       pLDDT ≥ 80 indicates the model is confident about the predicted loop
+       structure.
+2. CDRH3-based clustering with MMseqs2 (easy-cluster):
+     - Clustering is done on CDRH3 sequences alone, not the full Fv.
+     - Parameters: 50% sequence identity, 80% coverage of the shorter sequence.
+3. Train/val split by cluster (not by individual sequence):
+     - Clusters are shuffled and greedily assigned to train until ~90% is reached.
+     - Splitting at the cluster level ensures no two sequences from the same cluster
+       appear in both train and val (preventing data leakage).
+4. Full Fv FASTA output: train.fasta / val.fasta.
+
+Inputs
+------
+  - FV_FASTA_*      : Paired VH:VL Fv sequences (SAbDab + three OAS batches).
+  - SPANS_CSV       : CSV with Chothia-based CDRH3 start/end positions in the
+                      concatenated VH+VL sequence for each SAbDab entry.
+  - RMSD_XLSX       : Per-antibody H3_RMSD values from ColabFold vs ground truth.
+  - OAS_CDR_DIR_*   : FASTA files with CDRH3 sequences for each OAS entry.
+  - OAS_PLDDT_DIRS  : Excel tables with per-CDR pLDDT statistics for OAS entries.
+
+Outputs
+-------
+  - OUT_TRAIN / OUT_VAL : Paired Fv FASTA files for training and validation.
+
+"""
+
 import os
 import re
 import random
@@ -46,8 +91,8 @@ SEED = 42
 WORKDIR = "/home/alanwu/Documents/iggen_model/data/mmseqs_h3_split_work"
 
 # Filtering thresholds
-SABDAB_H3_RMSD_MAX = 2.0
-OAS_PLDDT_THRESHOLD = 80.0
+SABDAB_H3_RMSD_MAX = 2.0   # Angstroms; entries above this are likely poorly predicted
+OAS_PLDDT_THRESHOLD = 80.0  # pLDDT; below this the predicted structure is low-confidence
 # =========================================
 
 random.seed(SEED)
@@ -66,6 +111,11 @@ def load_fv_fasta(path: str) -> list[SeqIO.SeqRecord]:
 
 
 def unique_id(rid: str, used: set[str], tag: str) -> str:
+    """
+    Avoid ID collisions when pooling sequences from multiple source files.
+    If the original ID already exists, append a dataset tag and an incrementing
+    counter until uniqueness is achieved.
+    """
     if rid not in used:
         return rid
     rid2 = f"{rid}|{tag}"
@@ -81,15 +131,25 @@ def write_fasta_wrapped(path: str, seq_map: dict[str, str], id_list: list[str], 
         for rid in id_list:
             f.write(f">{rid}\n")
             s = seq_map[rid]
+            # Standard 80-character line wrap for FASTA compatibility
             for k in range(0, len(s), wrap):
                 f.write(s[k:k+wrap] + "\n")
 
 
 def normalize_spans_key(x: str) -> str:
+    """
+    Extract the bare PDB/antibody ID from a FASTA header that may contain
+    pipe-separated fields (e.g. '7w55.pdb|VH:VL' → '7w55.pdb').
+    """
     return str(x).strip().split("|", 1)[0]
 
 
 def normalize_id_for_merge(x: str) -> str:
+    """
+    Create a canonical lowercase key for joining SAbDab IDs across different
+    tables (spans CSV vs RMSD Excel) that may have inconsistent suffixes
+    like '.pdb' or pipe annotations.
+    """
     x = str(x).strip()
     x = x.replace(".pdb", "")
     x = x.split("|", 1)[0]
@@ -97,6 +157,12 @@ def normalize_id_for_merge(x: str) -> str:
 
 
 def canonicalize_oas_key(s: str) -> str:
+    """
+    Normalize OAS antibody IDs for robust dictionary lookup.
+    OAS IDs frequently contain double-underscores or repeated underscores
+    from how paired heavy/light chain IDs are concatenated; collapsing them
+    prevents spurious lookup misses.
+    """
     s = str(s).strip().lower()
     s = s.replace("__", "_")
     s = re.sub(r"_+", "_", s)
@@ -104,6 +170,13 @@ def canonicalize_oas_key(s: str) -> str:
 
 
 def parse_two_contigs(key: str):
+    """
+    OAS paired IDs are formed by joining two contig IDs, e.g.:
+      'seqA_contig_1_seqB_contig_2'
+    This extracts both halves so we can try both orderings when looking up
+    a key in the pLDDT table (the two halves may appear in either order
+    depending on which FASTA was read first).
+    """
     k = canonicalize_oas_key(key)
     m = re.match(r"^(.*?_contig_\d+)_(.*?_contig_\d+)$", k)
     if not m:
@@ -112,6 +185,11 @@ def parse_two_contigs(key: str):
 
 
 def list_fasta_files(path_like: str) -> list[Path]:
+    """
+    Accept either a direct FASTA file path or a directory.
+    When a directory is given, collect all files with recognised FASTA
+    extensions; fall back to every file in the directory if none match.
+    """
     p = Path(path_like)
     if p.is_dir():
         files = []
@@ -124,6 +202,11 @@ def list_fasta_files(path_like: str) -> list[Path]:
 
 
 def load_and_merge_oas_plddt_tables(oas_dirs: list[str]) -> pd.DataFrame:
+    """
+    Each OAS batch generates one Excel file of per-antibody CDR pLDDT statistics.
+    This concatenates them all and deduplicates by canonical antibody ID so that
+    the same entry appearing in multiple batches is counted only once.
+    """
     xlsx_files = []
     for d in oas_dirs:
         xlsx_files.extend(glob.glob(os.path.join(d, "**", "*.xlsx"), recursive=True))
@@ -142,6 +225,7 @@ def load_and_merge_oas_plddt_tables(oas_dirs: list[str]) -> pd.DataFrame:
     if "antibody_id" not in merged.columns:
         raise RuntimeError("Merged OAS table missing column 'antibody_id'.")
 
+    # Deduplicate after canonicalizing IDs; keep first occurrence
     merged["_canon_key"] = merged["antibody_id"].astype(str).map(canonicalize_oas_key)
     merged = merged.drop_duplicates(subset=["_canon_key"], keep="first").drop(columns=["_canon_key"])
 
@@ -150,12 +234,19 @@ def load_and_merge_oas_plddt_tables(oas_dirs: list[str]) -> pd.DataFrame:
 
 
 def build_oas_lookup(oas_df: pd.DataFrame) -> dict[str, pd.Series]:
+    """
+    Build a fast lookup dict for OAS pLDDT rows.
+    Because paired IDs consist of two contig halves that can appear in either
+    order, we register both orderings (A_B and B_A) so that lookups succeed
+    regardless of which order the calling code uses.
+    """
     lut = {}
     for _, row in oas_df.iterrows():
         ab = canonicalize_oas_key(row["antibody_id"])
         lut[ab] = row
         a, b = parse_two_contigs(ab)
         if a is not None:
+            # Register reversed-order key as an alias
             lut[f"{b}_{a}"] = row
     return lut
 
@@ -164,6 +255,14 @@ def build_oas_lookup(oas_df: pd.DataFrame) -> dict[str, pd.Series]:
 # SAbDab loading/filtering
 # ----------------------------
 def load_sabdab_metadata(spans_csv: str, rmsd_xlsx: str) -> dict[str, dict]:
+    """
+    Join the loop-span table (CDRH3 start/end positions within the Fv sequence)
+    with the RMSD table (ColabFold prediction quality vs PDB ground truth).
+    The join is performed on a normalised antibody ID to handle format
+    inconsistencies between the two files.
+
+    Returns a dict keyed by the FASTA header ID of each SAbDab entry.
+    """
     spans = pd.read_csv(spans_csv)
     rmsd = pd.read_excel(rmsd_xlsx)
 
@@ -190,7 +289,7 @@ def load_sabdab_metadata(spans_csv: str, rmsd_xlsx: str) -> dict[str, dict]:
     for _, row in merged.iterrows():
         hid = normalize_spans_key(row["fasta_header_id"])
         if hid in out:
-            continue
+            continue  # take only the first match if the same ID appears multiple times
         out[hid] = {
             "H3_start": row["H3_start"],
             "H3_end": row["H3_end"],
@@ -209,6 +308,9 @@ def extract_and_filter_sabdab_h3(
     rmsd_thr: float,
 ) -> tuple[dict[str, str], dict[str, int]]:
     """
+    For each SAbDab Fv record, apply quality filters and extract the CDRH3
+    subsequence using precomputed span positions.
+
     Returns:
       selected_map: normalized SAbDab id -> H3 sequence
       stats dict
@@ -240,6 +342,7 @@ def extract_and_filter_sabdab_h3(
         fv_len_meta = meta.get("Fv_len", None)
         h3_rmsd = meta.get("H3_RMSD", None)
 
+        # Any NaN in span coordinates or RMSD makes the entry unusable
         if pd.isna(s) or pd.isna(e) or pd.isna(fv_len_meta) or pd.isna(h3_rmsd):
             stats["drop_missing_values"] += 1
             continue
@@ -253,15 +356,21 @@ def extract_and_filter_sabdab_h3(
             stats["drop_missing_values"] += 1
             continue
 
+        # Primary quality gate: exclude entries where ColabFold could not
+        # accurately reconstruct the CDRH3 loop geometry
         if h3_rmsd > rmsd_thr:
             stats["drop_rmsd_fail"] += 1
             continue
 
         seq = str(rec.seq).strip().upper()
+
+        # Tolerate minor mismatches between the stored Fv length and the
+        # actual FASTA sequence length (e.g. trailing residue differences)
         if len(seq) != fv_len_meta:
             stats["warn_fv_len_mismatch"] += 1
             fv_len_meta = len(seq)
 
+        # Clamp span to valid range before slicing
         s = max(0, min(s, fv_len_meta))
         e = max(0, min(e, fv_len_meta))
         if e <= s:
@@ -283,6 +392,13 @@ def extract_and_filter_sabdab_h3(
 # OAS loading/filtering
 # ----------------------------
 def read_oas_cdrh3_from_dirs(*paths: str) -> dict[str, str]:
+    """
+    Scan one or more FASTA files/directories for CDRH3 entries.
+    OAS CDR FASTA files contain all six loops per antibody in a single file,
+    tagged with '|CDRH3', '|CDRL1', etc. in the header. We extract only CDRH3.
+    The base ID (before the first '|') is used as the lookup key so it can be
+    matched against the paired Fv FASTA records.
+    """
     out = {}
     n_files = 0
     n_records = 0
@@ -296,6 +412,7 @@ def read_oas_cdrh3_from_dirs(*paths: str) -> dict[str, str]:
                 rid = rec.id
                 desc = rec.description
 
+                # Support both formats: tag in ID field or in description field
                 if "|CDRH3" in rid:
                     base = rid.split("|", 1)[0]
                 elif "|CDRH3" in desc:
@@ -322,6 +439,15 @@ def filter_oas_fv_records(
     plddt_thr: float,
 ) -> tuple[dict[str, str], dict[str, int]]:
     """
+    Filter OAS Fv records by requiring:
+      1. A matching CDRH3 sequence exists in the CDR FASTA files.
+      2. A pLDDT row exists in the merged Excel tables.
+      3. The CDRH3 mean pLDDT exceeds the threshold.
+
+    The pLDDT is used as a proxy for structural confidence: sequences whose
+    AlphaFold predictions have high pLDDT are more likely to have a well-defined
+    loop geometry that a model can learn from.
+
     Returns:
       selected_map: original OAS rec.id -> H3 sequence
       stats dict
@@ -348,6 +474,8 @@ def filter_oas_fv_records(
 
         key = canonicalize_oas_key(base)
         row = oas_lookup.get(key, None)
+
+        # If the direct key lookup fails, try the reversed-contig ordering
         if row is None:
             a, b = parse_two_contigs(key)
             if a is not None:
@@ -368,6 +496,7 @@ def filter_oas_fv_records(
             stats["drop_missing_plddt"] += 1
             continue
 
+        # Primary quality gate for OAS entries
         if mp < plddt_thr:
             stats["drop_plddt_fail"] += 1
             continue
@@ -408,6 +537,9 @@ def main():
     oas_h3_by_base = read_oas_cdrh3_from_dirs(OAS_CDR_DIR_1, OAS_CDR_DIR_2, OAS_CDR_DIR_3)
 
     # ---- FILTER FIRST
+    # Quality filtering precedes clustering so that MMseqs2 sees only
+    # sequences we actually want to keep; this avoids low-quality sequences
+    # acting as cluster representatives.
     sabdab_selected_h3, sab_stats = extract_and_filter_sabdab_h3(
         fv_records=fv_records_sabdab,
         sabdab_meta=sabdab_meta,
@@ -434,6 +566,8 @@ def main():
     )
 
     # ---- Build final selected FV pool ONLY from filtered sequences
+    # We rebuild from the original records (not the H3-only map) so the
+    # output FASTAs contain the full paired Fv sequence.
     fv_seqs: dict[str, str] = {}
     h3_map: dict[str, str] = {}
     used_ids: set[str] = set()
@@ -441,6 +575,7 @@ def main():
     def add_selected_records(records, selected_h3_map, tag, key_func=None):
         kept = 0
         for r in records:
+            # key_func translates from the record ID to the key used in selected_h3_map
             lookup_id = key_func(r.id) if key_func is not None else r.id
             if lookup_id not in selected_h3_map:
                 continue
@@ -517,6 +652,10 @@ def main():
         raise RuntimeError("No sequences passed filtering. Nothing to cluster/split.")
 
     # ---- Write selected CDRH3 FASTA for MMseqs2 clustering
+    # We cluster on CDRH3 only (not the full Fv) because CDRH3 is the most
+    # variable region and the primary driver of antigen specificity. Clustering
+    # on the full Fv would be slower and would over-cluster based on conserved
+    # framework regions.
     h3_fasta = workdir / "cdrh3_selected.fasta"
     with open(h3_fasta, "w") as f:
         for rid, h3 in h3_map.items():
@@ -545,6 +684,7 @@ def main():
         "--cov-mode", str(COV_MODE),
     ])
 
+    # Parse the TSV output: each line is 'representative<TAB>member'
     tsv_path = Path(str(cluster_prefix) + "_cluster.tsv")
     if not tsv_path.exists():
         raise RuntimeError(f"Expected cluster TSV not found: {tsv_path}")
@@ -569,6 +709,9 @@ def main():
     print(f"MMseqs params: min_seq_id={MIN_SEQ_ID}, coverage={COVERAGE}, cov_mode={COV_MODE}")
 
     # ---- Split by cluster
+    # Shuffling clusters before greedy assignment ensures the train/val
+    # boundary falls roughly at the target ratio regardless of cluster order,
+    # and prevents systematic bias (e.g. all SAbDab clusters at the end).
     random.shuffle(cluster_list)
     total = sum(len(c) for c in cluster_list)
     target_train = int(TRAIN_RATIO * total)
@@ -577,6 +720,8 @@ def main():
     val_ids: list[str] = []
     count = 0
 
+    # Greedy cluster-level assignment: assign entire clusters to train until
+    # the target count is reached, then the remainder goes to val.
     for c in cluster_list:
         if count < target_train:
             train_ids.extend(c)
@@ -584,10 +729,12 @@ def main():
         else:
             val_ids.extend(c)
 
+    # Sanity check: cluster-level splitting guarantees no overlap
     assert set(train_ids).isdisjoint(val_ids)
 
     # ---- Source breakdown after split
     def count_source(ids):
+        # SAbDab entries originate from PDB files and retain the .pdb suffix
         sab = sum(1 for x in ids if x.split("|", 1)[0].endswith(".pdb"))
         oas = len(ids) - sab
         return sab, oas

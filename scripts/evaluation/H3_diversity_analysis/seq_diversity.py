@@ -1,4 +1,43 @@
 #!/usr/bin/env python3
+"""
+H3 Sequence Diversity Analysis
+================================
+Measures the within-set sequence diversity of generated CDR-H3 loops for two
+model variants — a Baseline (IgGen) and a Finetuned (OAS) model — and produces
+summary statistics and publication-ready plots.
+
+Two complementary diversity metrics are computed:
+
+1. **Nearest-Neighbour (NN) Identity**
+   For every sequence in a set, the closest other sequence (by global pairwise
+   alignment identity) within the *same* set is found.  The distribution of these
+   NN identity scores characterises within-set redundancy: a lower mean means
+   sequences are more diverse relative to each other.
+
+2. **Unique Fraction**
+   The fraction of sequences whose exact string is unique within the set.
+   A value of 1.0 means every generated sequence is distinct.
+
+Inputs
+------
+- IGGEN_FASTA  : FASTA of IgGen-generated CDR-H3 sequences (Chothia-numbered).
+- OAS_FASTA    : FASTA of OAS-finetuned model CDR-H3 sequences.
+
+Outputs (written to IGGEN_OUT_DIR, OAS_OUT_DIR, and COMBINED_OUT_DIR)
+----------------------------------------------------------------------
+- *_nn_identity_per_sequence.tsv : Per-sequence NN identity table.
+- *_diversity_summary.tsv        : Single-row summary (total, unique count, fractions).
+- *_nn_identity_distribution.png : Histogram of NN identity for one group.
+- combined_nn_identity_distribution.png : Overlapping histograms for both groups.
+- combined_unique_fraction_bar.png      : Side-by-side bar chart of unique fractions.
+
+Algorithm note
+--------------
+Global Needleman-Wunsch alignment is used with a simple match/mismatch/gap
+scheme.  Identity is defined as (exact matches) / max(len(seq1), len(seq2)),
+which penalises length differences — important for CDR-H3 loops whose length
+varies considerably.
+"""
 
 import os
 from typing import List, Tuple, Dict
@@ -6,6 +45,8 @@ from typing import List, Tuple, Dict
 import numpy as np
 import matplotlib.pyplot as plt
 from Bio import SeqIO
+
+plt.rcParams.update({'font.size': 14})
 from Bio.Align import PairwiseAligner
 
 
@@ -23,6 +64,7 @@ os.makedirs(IGGEN_OUT_DIR, exist_ok=True)
 os.makedirs(OAS_OUT_DIR, exist_ok=True)
 os.makedirs(COMBINED_OUT_DIR, exist_ok=True)
 
+# Consistent colour scheme shared with other evaluation scripts in this project
 GROUP_COLORS = {
     "Baseline": "#f5c87a",
     "Finetuned": "#a8c8e8",
@@ -51,6 +93,8 @@ def sequence_identity(seq1: str, seq2: str, aligner: PairwiseAligner) -> float:
     aln2 = alignment[1]
 
     matches = sum(a == b for a, b in zip(aln1, aln2) if a != "-" and b != "-")
+    # Normalise by the longer sequence so that a perfect subsequence match does
+    # not yield 100% identity — a meaningful penalty for length mismatches in H3
     denom = max(len(seq1), len(seq2))
     return matches / denom if denom > 0 else 0.0
 
@@ -62,6 +106,9 @@ def compute_nn_identity(records: List[Tuple[str, str]]) -> List[Dict]:
     if len(records) < 2:
         raise ValueError("Need at least 2 sequences to compute nearest-neighbour identity.")
 
+    # Gap penalties chosen to discourage spurious gapped alignments on short H3
+    # loops; open gap is heavier than extend so single large gaps are preferred
+    # over many small ones, which is more biologically sensible for CDR loops
     aligner = PairwiseAligner()
     aligner.mode = "global"
     aligner.match_score = 1.0
@@ -133,6 +180,8 @@ def plot_single_group_nn_distribution(vals: List[float], group_name: str, outpat
     color = GROUP_COLORS[group_name]
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    # 30 bins over [0, 1] gives 0.033-wide bins, appropriate resolution for
+    # identity scores that typically span ~0.2–1.0 for H3 loops
     bins = np.linspace(0, 1, 31)
 
     ax.hist(vals, bins=bins, alpha=0.8, color=color, edgecolor="black", linewidth=0.5)
@@ -140,6 +189,8 @@ def plot_single_group_nn_distribution(vals: List[float], group_name: str, outpat
     mean_val = np.mean(vals)
     ax.axvline(mean_val, linestyle="--", linewidth=2, color="black")
 
+    # Annotate the mean line; placed near the top with slight left offset so
+    # it does not overlap the bar that the line passes through
     ymax = ax.get_ylim()[1]
     ax.text(
         mean_val,
@@ -148,13 +199,12 @@ def plot_single_group_nn_distribution(vals: List[float], group_name: str, outpat
         rotation=90,
         va="top",
         ha="right",
-        fontsize=10,
+        fontsize=14,
         bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1.5)
     )
 
     ax.set_xlabel("Nearest-neighbour identity")
     ax.set_ylabel("Count")
-    ax.set_title(f"{group_name} H3 NN identity distribution")
     ax.set_xlim(0, 1)
 
     plt.tight_layout()
@@ -166,6 +216,7 @@ def plot_combined_nn_distribution(group_to_nn: Dict[str, List[float]], outpath: 
     fig, ax = plt.subplots(figsize=(7, 5.5))
     bins = np.linspace(0, 1, 31)
 
+    # alpha=0.45 keeps both histograms visible when they overlap
     for group_name, vals in group_to_nn.items():
         vals = np.array(vals, dtype=float)
         color = GROUP_COLORS[group_name]
@@ -183,7 +234,6 @@ def plot_combined_nn_distribution(group_to_nn: Dict[str, List[float]], outpath: 
 
     ax.set_xlabel("Nearest-neighbour identity")
     ax.set_ylabel("Count")
-    ax.set_title("H3 NN identity distribution")
     ax.set_xlim(0, 1)
     ax.legend(frameon=False)
 
@@ -200,6 +250,8 @@ def plot_combined_unique_fraction(unique_summary: Dict[str, Dict[str, float]], o
     fig, ax = plt.subplots(figsize=(5.5, 5))
     bars = ax.bar(groups, fracs, color=colors, edgecolor="black", linewidth=0.8)
 
+    # Label each bar with its exact value to avoid needing the y-axis for
+    # precise reading
     for bar, val in zip(bars, fracs):
         ax.text(
             bar.get_x() + bar.get_width() / 2,
@@ -207,12 +259,11 @@ def plot_combined_unique_fraction(unique_summary: Dict[str, Dict[str, float]], o
             f"{val:.3f}",
             ha="center",
             va="bottom",
-            fontsize=10
+            fontsize=14
         )
 
     ax.set_ylabel("Unique fraction")
     ax.set_ylim(0, 1.05)
-    ax.set_title("Fraction of unique H3 sequences")
 
     plt.tight_layout()
     plt.savefig(outpath, dpi=300)
@@ -223,6 +274,7 @@ def plot_combined_unique_fraction(unique_summary: Dict[str, Dict[str, float]], o
 # MAIN
 # ============================================
 def main():
+    # "Baseline" = raw IgGen output, "Finetuned" = OAS-finetuned variant
     datasets = {
         "Baseline": {
             "fasta": IGGEN_FASTA,
@@ -236,6 +288,7 @@ def main():
         },
     }
 
+    # Accumulate across both groups so combined plots can be made at the end
     group_to_nn = {}
     unique_summary = {}
 
@@ -248,6 +301,8 @@ def main():
         if len(records) == 0:
             raise ValueError(f"No sequences found in {fasta_path}")
 
+        # O(n^2) all-vs-all within the set — acceptable for typical generated
+        # set sizes of a few hundred to low thousands of sequences
         nn_results = compute_nn_identity(records)
         nn_values = [x["nn_identity"] for x in nn_results]
         mean_nn_identity = float(np.mean(nn_values))
