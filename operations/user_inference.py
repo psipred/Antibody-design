@@ -88,7 +88,9 @@ class CustomPIgGen:
         )
         self.model.eval()
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            tokenizer_name, cache_dir=cache_dir
+            tokenizer_name,
+            cache_dir=cache_dir,
+            clean_up_tokenization_spaces=False,
         )
 
         if device is None:
@@ -125,7 +127,9 @@ class CustomPIgGen:
         )
 
         decoded_sequences = self.tokenizer.batch_decode(
-            generated_token_ids, skip_special_tokens=True
+            generated_token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
         )
         return decoded_sequences
 
